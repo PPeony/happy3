@@ -1,0 +1,121 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # --------------------------------------------------
+  # Windows 打包
+  # 使用 flet pack（基于 PyInstaller）
+  # --------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build Windows exe
+        run: flet pack main.py --name "happyhappyhappy" --icon "img/app.ico"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: happyhappyhappy-windows
+          # flet pack 产物默认在 dist/ 目录
+          path: dist/happyhappyhappy.exe
+          retention-days: 30
+
+  # --------------------------------------------------
+  # macOS 打包
+  # ico -> icns 转换后再 flet pack
+  # --------------------------------------------------
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install Pillow
+
+      - name: Convert ico to icns
+        run: |
+          # 把 ico 转成 png，再用 iconutil 生成 icns
+          mkdir -p img/app.iconset
+          python3 - << 'EOF'
+          from PIL import Image
+          import os
+          sizes = [16, 32, 64, 128, 256, 512]
+          img = Image.open("img/app.ico")
+          for s in sizes:
+              resized = img.resize((s, s), Image.LANCZOS)
+              resized.save(f"img/app.iconset/icon_{s}x{s}.png")
+              resized_2x = img.resize((s*2, s*2), Image.LANCZOS)
+              resized_2x.save(f"img/app.iconset/icon_{s}x{s}@2x.png")
+          EOF
+          iconutil -c icns img/app.iconset -o img/app.icns
+
+      - name: Build macOS app
+        run: flet pack main.py --name "happyhappyhappy" --icon "img/app.icns"
+
+      - name: Zip macOS app
+        run: |
+          cd dist
+          zip -r happyhappyhappy-macos.zip happyhappyhappy.app
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: happyhappyhappy-macos
+          path: dist/happyhappyhappy-macos.zip
+          retention-days: 30
+
+  # --------------------------------------------------
+  # 发布 Release（仅打 tag 时触发）
+  # --------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: happyhappyhappy-windows
+          path: dist/
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: happyhappyhappy-macos
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/happyhappyhappy.exe
+            dist/happyhappyhappy-macos.zip
+          generate_release_notes: true

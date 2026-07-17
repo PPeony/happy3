@@ -1,0 +1,77 @@
+# ============================================================
+# happyhappyhappy CI/CD — 打包流水线
+#
+# 前置条件（Runner 机器上需要提前安装好）：
+#   Windows Runner:
+#     - 注册 GitLab Runner，tag 设为 windows
+#     - 安装 Python 3.x（python / pip 在 PATH 里）
+#     - 安装 Flutter SDK（flutter 在 PATH 里）
+#     - 安装 Visual Studio 2022 Build Tools（flet build windows 需要）
+#   macOS Runner:
+#     - 注册 GitLab Runner，tag 设为 macos
+#     - 安装 Python 3.x（python3 / pip3 在 PATH 里）
+#     - 安装 Flutter SDK（flutter 在 PATH 里）
+#     - 安装 Xcode + CocoaPods（flet build macos 需要）
+#
+# 触发时机：push 到 main 分支，或打 tag（如 v1.0.0）时触发。
+# ============================================================
+
+stages:
+  - build
+
+variables:
+  APP_NAME: happyhappyhappy
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+# ------------------------------------------------------------
+# Windows 打包
+# 产物：build/windows/x64/runner/Release/happyhappyhappy.exe
+# ------------------------------------------------------------
+build-windows:
+  stage: build
+  tags:
+    - windows          # Runner 注册时打的 tag，改成你们实际的 tag
+  cache:
+    key: "pip-windows-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .pip-cache/
+  before_script:
+    - python -m pip install --upgrade pip --cache-dir .pip-cache
+    - pip install -r requirements.txt --cache-dir .pip-cache
+  script:
+    - flet build windows --project $APP_NAME
+  artifacts:
+    name: "${APP_NAME}-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - build/windows/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+# ------------------------------------------------------------
+# macOS 打包
+# 产物：build/macos/Build/Products/Release/happyhappyhappy.app
+# ------------------------------------------------------------
+build-macos:
+  stage: build
+  tags:
+    - macos             # Runner 注册时打的 tag，改成你们实际的 tag
+  cache:
+    key: "pip-macos-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .pip-cache/
+  before_script:
+    - python3 -m pip install --upgrade pip --cache-dir .pip-cache
+    - pip3 install -r requirements.txt --cache-dir .pip-cache
+  script:
+    - flet build macos --project $APP_NAME
+  artifacts:
+    name: "${APP_NAME}-macos-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - build/macos/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true   # macOS Runner 暂时没有时不阻塞流水线
