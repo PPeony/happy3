@@ -278,9 +278,10 @@ class Candidate:
 |------|-----------|----------|
 | 开发（本机） | `python main.py` | `python main.py --cli query ...` |
 | Windows 打包产物 | `happyhappyhappy.exe` | `happyhappyhappy.exe --cli query ...` |
-| macOS 打包产物 | `happyhappyhappy` | `./happyhappyhappy --cli query ...` |
+| macOS 打包产物（GUI） | `happyhappyhappy.app` | 双击启动 |
+| macOS 打包产物（CLI） | `happyhappyhappy.app/Contents/MacOS/happyhappyhappy` | `happyhappyhappy.app/Contents/MacOS/happyhappyhappy --cli query ...` |
 
-下文示例统一用 `happyhappyhappy` 代表可执行文件名，实际替换为对应平台的文件名即可。
+> macOS 直接运行 `happyhappyhappy` 会被系统用 `open` 命令当作 app bundle 打开，不认 `--cli` 参数。CLI 模式必须调用 bundle 内部的二进制文件。
 
 ### 子命令
 

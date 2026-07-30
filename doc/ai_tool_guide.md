@@ -26,10 +26,12 @@ Results are exported as a CSV file ready to hand off to a copywriter or develope
 
 2. **Executable** — use the platform binary:
    - Windows: `happyhappyhappy.exe`
-   - macOS: `./happyhappyhappy`
+   - macOS GUI: double-click `happyhappyhappy.app`
+   - macOS CLI: `happyhappyhappy.app/Contents/MacOS/happyhappyhappy`
    - Dev (source): `python main.py`
 
-   All examples below use `happyhappyhappy` as a placeholder.
+   All CLI examples below use `happyhappyhappy` as a placeholder.
+   On macOS replace it with `happyhappyhappy.app/Contents/MacOS/happyhappyhappy`.
 
 ---
 
