@@ -365,6 +365,12 @@ happyhappyhappy --cli full \
 ```bash
 flet pack main.py --name "happyhappyhappy" --icon "img/app.ico"
 ```
+正式包发布
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 测试
 ```bash
 # ut

@@ -3,6 +3,8 @@
 You are an AI assistant helping a product manager extract i18n keys from UI screenshots.
 This document tells you exactly how to drive the `happyhappyhappy` CLI to complete the full workflow.
 
+**CRITICAL: This is a multi-step workflow. You MUST stop and wait for user confirmation between Step 2 and Step 3. Do NOT proceed to Step 3 automatically.**
+
 ---
 
 ## What this tool does
@@ -33,28 +35,50 @@ Results are exported as a CSV file ready to hand off to a copywriter or develope
 
 ## Step-by-step workflow
 
-### Step 1 — You receive a screenshot
+### Step 1 — Receive the screenshot
 
 The user sends you a screenshot of a UI page.
 
+Before extracting, **ask the user one question**:
 
-### Step 2 — Extract Chinese strings
+> 这些文本是否来自同一个接口或同一类数据？（如果是，我可以自动推断重复词条的归属）
 
-Identify all visible Chinese text. Output **only** the strings themselves, no labels or explanations.
-Produce a `texts.json` file:
+If the user says yes → add `--same-interface` flag in Step 3.
+If the user says no or unsure → do not add the flag.
 
+### Step 2 — Extract Chinese strings and WAIT for confirmation
+
+Identify all visible Chinese text from the screenshot.
+
+Present the list to the user in the chat like this:
+
+> 我从截图中识别到以下中文文本，请确认是否正确：
+> 1. 金额
+> 2. 房间号
+> 3. 确认订单
+> 4. 取消
+>
+> 如有遗漏或多余，请告诉我，确认无误后我再继续查询。
+
+**STOP HERE. Do NOT proceed to Step 3 until the user explicitly confirms.**
+
+Wait for the user to reply with one of:
+- "对" / "没问题" / "确认" → proceed to Step 3 with the current list
+- corrections like "少了XX" / "去掉XX" / "改成XX" → update the list, show the revised list, and ask for confirmation again
+- a completely new list → use that list and ask for confirmation
+
+Only move to Step 3 after the user has confirmed the list.
+
+### Step 3 — Run the query
+
+Write the confirmed list to `~/Desktop/texts.json`:
 ```json
 {
   "texts": ["金额", "房间号", "确认订单", "取消"]
 }
 ```
 
-**Important: You need to tell user the Chinese you find. It can help user to check the result.**
-
-Write this file to a known path, e.g. `~/Desktop/texts.json`.
-
-### Step 3 — Run the query
-
+**Without** same-interface:
 ```bash
 happyhappyhappy --cli full \
   --texts-file ~/Desktop/texts.json \
@@ -62,18 +86,54 @@ happyhappyhappy --cli full \
   --output ~/Desktop/i18n_result.csv
 ```
 
-This performs login + query + CSV export in one step.
+**With** same-interface (user confirmed all strings are from the same interface):
+```bash
+happyhappyhappy --cli full \
+  --texts-file ~/Desktop/texts.json \
+  --use-saved-creds \
+  --same-interface \
+  --output ~/Desktop/i18n_result.csv
+```
+
+When `--same-interface` is used, the tool automatically resolves ambiguous entries using the trip_appid found in other `found` entries from the same query. See "Same-interface resolution" section below.
 
 ### Step 4 — Read the CSV and report back
 
-Open `~/Desktop/i18n_result.csv` (UTF-8 with BOM) and summarize the results to the user:
+Open `~/Desktop/i18n_result.csv` (UTF-8 with BOM) and summarize the results to the user in the chat. Do not ask the user to open the file themselves.
+
+Report format:
+> 查询完成，共 N 条：
+> - ✓ 金额 → key: pos.amount，英文: Amount
+> - ✓ 房间号 → key: pos.room.no，英文: Room No.（已自动推断）
+> - ✗ 获取微信实例异常 → 未找到
+> - ⚠ 确认订单 → 有歧义，已写入 CSV，请发给研发确认
+
+Status meanings:
 
 | status | meaning | action |
 |--------|---------|--------|
 | `found` | unique match found | ready to use |
 | `not_found` | no match in database | inform user, skip row |
-| `ambiguous` | multiple candidates | CSV contains all candidates with `note=待研发确认`; tell user to send the CSV to a developer for confirmation |
-| `confirmed` | previously confirmed by developer (re-import flow) | ready to use |
+| `ambiguous` | multiple candidates | CSV contains all candidates with `note=待研发确认`; tell user to send CSV to developer |
+| `confirmed` | auto-resolved or previously confirmed | ready to use |
+
+---
+
+## Same-interface resolution
+
+When the user declares all strings come from the same interface/API, add `--same-interface` to `full` or `query`.
+
+**How it works:**
+1. After querying, the tool collects all `trip_appid` values from `found` entries.
+2. If all `found` entries share the **same** `trip_appid` → ambiguous entries are filtered to keep only candidates with that appid. If exactly one candidate remains, it is automatically upgraded to `found`.
+3. If `found` entries have **different** `trip_appid` values → the tool prints a warning and does NOT auto-resolve:
+
+```
+[WARNING] 同一接口返回的 trip_appid 不同：['100061217', '100074326']，无法自动推断，请用户手动确认歧义项。
+```
+
+When you see this warning, tell the user:
+> ⚠ 警告：查询结果中发现不同的 trip_appid（XXX 和 YYY），无法自动推断歧义项归属。请手动确认，或检查这些文本是否真的来自同一接口。
 
 ---
 
@@ -95,7 +155,8 @@ happyhappyhappy --cli full \
   --texts-file <path/to/texts.json> \
   --use-saved-creds \
   --output <path/to/output.csv> \
-  [--ambiguous all|skip]   # default: all
+  [--same-interface] \
+  [--ambiguous all|skip]
 ```
 
 ### `query` — query only, output JSON
@@ -104,7 +165,8 @@ happyhappyhappy --cli full \
 happyhappyhappy --cli query \
   --texts-file <path/to/texts.json> \
   --use-saved-creds \
-  --output <path/to/result.json>
+  --output <path/to/result.json> \
+  [--same-interface]
 ```
 
 ### `export` — convert query JSON to CSV
@@ -115,26 +177,15 @@ Input is the **JSON file** produced by `query`. Do not pass a CSV here.
 happyhappyhappy --cli export \
   --input  <path/to/result.json> \
   --output <path/to/output.csv> \
-  [--ambiguous all|skip]   # default: all
+  [--ambiguous all|skip]
 ```
 
 ### `import` — process developer-edited CSV, output clean CSV
-
-Input is a **CSV file** that was previously exported and then edited by a developer
-(they deleted the wrong candidate rows, keeping exactly one row per Chinese string).
 
 ```bash
 happyhappyhappy --cli import \
   --input  <path/to/dev_confirmed.csv> \
   --output <path/to/final.csv>
-```
-
-The command prints a summary:
-```
-Processed 10 entries -> final.csv
-  confirmed (dev resolved) : 3
-  found                    : 6
-  not_found                : 1
 ```
 
 ### Auth options (same for `query` and `full`)
@@ -161,56 +212,20 @@ Processed 10 entries -> final.csv
 | `status` | `found` / `not_found` / `ambiguous` / `confirmed` |
 | `note` | `待研发确认` for ambiguous rows, otherwise empty |
 
-### JSON result format (from `query`)
-
-```json
-{
-  "results": [
-    {
-      "zh_cn": "金额",
-      "status": "found",
-      "trip_appid": "100074326",
-      "key": "pos.amount",
-      "en_us": "Amount"
-    },
-    {
-      "zh_cn": "房间号",
-      "status": "ambiguous",
-      "candidates": [
-        {"trip_appid": "100074326", "key": "pos.room.no",    "en_us": "Room No."},
-        {"trip_appid": "100061217", "key": "hotel.room.num", "en_us": "Room Number"}
-      ]
-    },
-    {
-      "zh_cn": "获取微信实例异常",
-      "status": "not_found"
-    }
-  ]
-}
-```
-
 ---
 
 ## Re-import flow (for ambiguous items)
 
-When there are ambiguous rows, follow these steps:
-
-**Step A — export includes all candidates**
-
-The `full` command (or `export`) already writes all candidate rows with `note=待研发确认`.
+**Step A** — The `full` command already writes all candidate rows with `note=待研发确认`.
 Tell the user: "请将 CSV 发给研发，研发在 CSV 里删掉每个中文词条多余的候选行，只保留正确的一行，然后发回给你。"
 
-**Step B — developer sends back the edited CSV**
-
-Run the `import` command to process it:
+**Step B** — When developer sends back the edited CSV, run:
 
 ```bash
 happyhappyhappy --cli import \
   --input  <path/to/dev_confirmed.csv> \
   --output <path/to/final.csv>
 ```
-
-This reads the CSV (not JSON), resolves any ambiguous rows where the developer left only one candidate, and writes a clean final CSV ready for the copywriter.
 
 **Do not use `export` for this step** — `export` only accepts JSON input from `query`.
 
@@ -223,22 +238,6 @@ This reads the CSV (not JSON), resolves any ambiguous rows where the developer l
 | `Error: no saved credentials` | credentials file missing | ask user to open app and log in with "记住密码" ticked |
 | `Login error: 登录失败` | wrong username/password | ask user to re-login via GUI |
 | `Auth error: Session 已过期` | session expired | re-login |
-| `Query error: ...` | Archery SQL error | check SQL or ask user to contact developer |
-| network timeout | not on intranet | confirm user is connected to VPN / office network |
-
----
-
-## Example full session
-
-```
-User: [sends screenshot of PMS checkout page]
-
-You:
-1. Extract Chinese strings from screenshot → texts.json
-2. Run: happyhappyhappy --cli full --texts-file texts.json --use-saved-creds --output result.csv
-3. Read result.csv
-4. Report:
-   - 金额 → found: trip_appid=100074326, key=pos.amount, en=Amount
-   - 房间号 → ambiguous: 2 candidates, please send CSV to developer
-   - 获取微信实例异常 → not_found: no entry in database
-```
+| `[WARNING] 同一接口返回的 trip_appid 不同` | same-interface flag used but found entries have different appids | warn user, do not auto-resolve |
+| `Query error: ...` | Archery SQL error | ask user to contact developer |
+| network timeout | not on intranet | confirm user is on VPN / office network |

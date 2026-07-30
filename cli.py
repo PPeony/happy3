@@ -168,6 +168,71 @@ def entries_from_csv(input_path: str) -> list[I18nEntry]:
 
 
 # ---------------------------------------------------------------------------
+# Same-interface hint: resolve ambiguous entries using known appid
+# ---------------------------------------------------------------------------
+
+class SameInterfaceConflict(Exception):
+    """Raised when found entries have inconsistent trip_appids."""
+    pass
+
+
+def apply_same_interface_hint(entries: list[I18nEntry]) -> list[I18nEntry]:
+    """
+    When the user declares all strings come from the same interface/API,
+    use the trip_appid(s) from `found` entries to narrow down ambiguous ones.
+
+    Rules:
+    1. Collect all trip_appids from `found` / `confirmed` entries.
+    2. If those appids are NOT all the same → raise SameInterfaceConflict
+       (caller should warn the user and skip auto-resolution).
+    3. If there is exactly one consistent appid → for each `ambiguous` entry,
+       keep only candidates matching that appid.
+       - Exactly 1 candidate remains → upgrade to `confirmed`.
+       - 0 candidates remain → keep as `ambiguous` (appid not in candidates).
+       - More than 1 candidate remains → keep as `ambiguous`.
+    4. If there are no `found` entries at all → nothing to infer, return as-is.
+    """
+    found_appids = {
+        e.trip_appid
+        for e in entries
+        if e.status in ("found", "confirmed") and e.trip_appid
+    }
+
+    if not found_appids:
+        return entries  # nothing to infer from
+
+    if len(found_appids) > 1:
+        raise SameInterfaceConflict(
+            f"同一接口返回的 trip_appid 不同：{sorted(found_appids)}，"
+            f"无法自动推断，请用户手动确认歧义项。"
+        )
+
+    # Exactly one consistent appid
+    target_appid = next(iter(found_appids))
+    resolved = []
+    for e in entries:
+        if e.status != "ambiguous":
+            resolved.append(e)
+            continue
+
+        matching = [c for c in e.candidates if c.trip_appid == target_appid]
+        if len(matching) == 1:
+            c = matching[0]
+            resolved.append(I18nEntry(
+                zh_cn=e.zh_cn,
+                status="found",
+                trip_appid=c.trip_appid,
+                key=c.key,
+                en_us=c.en_us,
+            ))
+        else:
+            # 0 or still multiple matches under this appid — keep ambiguous
+            resolved.append(e)
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Auth helper
 # ---------------------------------------------------------------------------
 
@@ -243,6 +308,15 @@ def cmd_query(args: argparse.Namespace) -> None:
         print(f"Query error: {e}", file=sys.stderr)
         sys.exit(3)
 
+    if getattr(args, "same_interface", False):
+        try:
+            entries = apply_same_interface_hint(entries)
+            auto_confirmed = sum(1 for e in entries if e.status == "confirmed")
+            if auto_confirmed:
+                print(f"[same-interface] auto-confirmed {auto_confirmed} ambiguous entries")
+        except SameInterfaceConflict as e:
+            print(f"[WARNING] {e}", file=sys.stderr)
+
     result = entries_to_json(entries)
     output = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
@@ -308,6 +382,15 @@ def cmd_full(args: argparse.Namespace) -> None:
         print(f"Query error: {e}", file=sys.stderr)
         sys.exit(3)
 
+    if getattr(args, "same_interface", False):
+        try:
+            entries = apply_same_interface_hint(entries)
+            auto_confirmed = sum(1 for e in entries if e.status == "confirmed")
+            if auto_confirmed:
+                print(f"[same-interface] auto-confirmed {auto_confirmed} ambiguous entries")
+        except SameInterfaceConflict as e:
+            print(f"[WARNING] {e}", file=sys.stderr)
+
     written = entries_to_csv(entries, args.output, ambiguous=args.ambiguous)
     print(f"Exported {written} rows -> {args.output}")
 
@@ -336,6 +419,8 @@ def run_cli(argv=None) -> None:
     p_query.add_argument("--texts", help="JSON array string, e.g. '[\"金额\",\"房间号\"]'")
     p_query.add_argument("--texts-file", dest="texts_file", help="path to texts.json")
     p_query.add_argument("--output", help="output JSON path (default: stdout)")
+    p_query.add_argument("--same-interface", dest="same_interface", action="store_true",
+                         help="all strings come from the same interface; auto-resolve ambiguous entries using the consistent trip_appid")
     _add_auth_args(p_query)
 
     p_export = sub.add_parser("export", help="convert query result JSON to CSV")
@@ -354,6 +439,8 @@ def run_cli(argv=None) -> None:
     p_full.add_argument("--texts", help="JSON array string")
     p_full.add_argument("--texts-file", dest="texts_file", help="path to texts.json")
     p_full.add_argument("--output", required=True, help="output CSV path")
+    p_full.add_argument("--same-interface", dest="same_interface", action="store_true",
+                        help="all strings come from the same interface; auto-resolve ambiguous entries using the consistent trip_appid")
     p_full.add_argument("--ambiguous", choices=["skip", "all"], default="all")
     _add_auth_args(p_full)
 
