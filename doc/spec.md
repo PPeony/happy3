@@ -43,10 +43,11 @@
 
 **认证流程：**
 
-1. 工具内嵌 WebView，加载登录页 `http://archery.rezen.work/login/`
-2. 用户在 WebView 内完成登录（支持账号密码或 SSO）
-3. 登录成功后，从响应中提取 `csrftoken` 和 `sessionid` cookie
+1. 工具弹出登录对话框，用户输入账号密码
+2. 工具向 `http://archery.rezen.work/authenticate/` 发送 AJAX 登录请求
+3. 登录成功后，从响应 cookie 中提取 `csrftoken` 和 `sessionid`
 4. 后续所有查询请求携带上述 cookie 和 CSRF Token
+5. 支持"记住密码"——凭据保存至 `~/.happyhappyhappy/credentials.json`，下次启动自动填入
 
 **表结构：**
 
@@ -115,10 +116,11 @@ WHERE zh.language_cd = 'zh-CN'
 
 **查询结果处理逻辑：**
 
-1. 按 `value`（即 `zh_cn`）对结果分组
+1. 按 `value`（即 `zh_cn`）对结果分组，白名单过滤（只保留 `trip_appid` 在白名单内的行）
 2. 每组命中 0 行 → 标记为 `not_found`
 3. 每组命中 1 行 → 直接采用，标记为 `found`
 4. 每组命中多行（同一中文对应多个 `trip_appid`/`key` 组合）→ 保留所有候选，标记为 `ambiguous`，进入第四步人工确认
+5. 若用户声明"同一接口"（CLI `--same-interface` 参数）：用已 `found` 条目的 `trip_appid` 过滤歧义候选，只剩 1 条则自动升级为 `found`；若 `found` 条目 appid 不一致则警告
 
 CSV 输出字段：`trip_appid`、`key`、`zh_cn`、`en_us`、`status`
 
@@ -144,7 +146,8 @@ CSV 输出字段：`trip_appid`、`key`、`zh_cn`、`en_us`、`status`
 | zh_cn | 中文原文 | 是 |
 | en_us | 英文译文 | 是 |
 | image_url | 界面截图链接 | 否，暂不实现，留空 |
-| status | 状态（found / not_found / confirmed） | 是 |
+| status | 状态（found / not_found / ambiguous / confirmed） | 是 |
+| note | 歧义项填"待研发确认"，其余留空 | 是 |
 
 CSV 保存到用户指定路径（通过系统文件对话框选择）。
 
@@ -179,9 +182,10 @@ CSV 保存到用户指定路径（通过系统文件对话框选择）。
 
 ### 登录子窗口
 
-- 弹出独立窗口，内嵌 WebView 加载 `http://archery.rezen.work/login/`
-- 用户完成登录后，窗口自动关闭，主界面显示"已登录"状态
-- 若 session 失效（查询返回 401/403），自动提示重新登录
+- 弹出 AlertDialog，包含用户名、密码输入框和"记住密码"勾选框
+- 登录成功后对话框关闭，主界面顶栏显示"已登录：用户名"
+- 若勾选"记住密码"，凭据写入 `~/.happyhappyhappy/credentials.json`，下次打开自动填入
+- 若 session 失效（查询返回重定向），自动提示重新登录
 
 ### 歧义确认子窗口
 
@@ -195,12 +199,12 @@ CSV 保存到用户指定路径（通过系统文件对话框选择）。
 
 | 项目 | 选型 |
 |------|------|
-| 语言 | Python 3.14 |
-| UI 框架 | Flet |
+| 语言 | Python 3.x（开发机 3.14，打包用 3.12） |
+| UI 框架 | Flet 0.21.2 |
 | 网络请求 | `requests` 库 |
-| WebView 登录 | `flet` 内置 WebView 组件 |
-| CSV 导出 | Python 内置 `csv` 模块 |
-| 打包 | GitLab CI/CD 流水线，`flet build` 命令 |
+| 登录 | 账号密码直接 POST `/authenticate/` |
+| CSV 导出/导入 | Python 内置 `csv` 模块 |
+| 打包 | GitHub Actions，`flet pack` 命令（基于 PyInstaller） |
 | 目标平台 | Windows、macOS |
 
 ---
@@ -212,18 +216,24 @@ CSV 保存到用户指定路径（通过系统文件对话框选择）。
 class I18nEntry:
     zh_cn: str                  # 原始中文
     trip_appid: str | None      # 携程应用 ID
-    key: str | None             # 最终确认的 key（None 表示未确认或未找到）
+    key: str | None             # 最终确认的 key（None 表示未找到）
     en_us: str | None           # 英文译文
-    candidates: list[dict]      # 候选项列表（歧义时有多个），每项含 trip_appid/key/en_us
+    candidates: list[Candidate] # 候选项列表（歧义时有多个），每项含 trip_appid/key/en_us
     status: Literal["found", "not_found", "ambiguous", "confirmed"]
+
+@dataclass
+class Candidate:
+    trip_appid: str
+    key: str
+    en_us: str | None
 ```
 
 ---
 
 ## Session 管理
 
-- 登录后 cookie 保存在内存中（不持久化到磁盘）
-- 每次工具启动都需重新登录
+- 登录后 cookie 保存在内存中
+- 支持"记住密码"：凭据持久化到 `~/.happyhappyhappy/credentials.json`，下次启动自动填入
 - 若查询返回非 200 或返回登录重定向，提示用户重新登录
 
 ---
@@ -242,17 +252,17 @@ class I18nEntry:
 
 ## 打包说明
 
-- 打包由 GitLab CI/CD 流水线执行，使用 `flet build windows` 和 `flet build macos`
+- 打包由 GitHub Actions 执行，使用 `flet pack main.py --name "happyhappyhappy" --icon "img/app.ico"`
 - 打包产物为独立可执行文件：Windows 为 `happyhappyhappy.exe`，macOS 为 `happyhappyhappy`，无需 Python 环境
+- push 到 `master` 分支自动触发打包，产物挂在 GitHub Actions Artifacts（保留 30 天）
+- 打 tag（如 `v1.0.0`）自动创建 GitHub Release，两个平台安装包作为附件
 - 本机（Windows）开发阶段直接运行 `python main.py` 启动 GUI，或 `python main.py --cli ...` 使用 CLI
-- 不在本机执行打包构建
 
 ---
 
 ## 待定/超出范围
 
 - 图片 URL 字段：暂不实现，CSV 中留空
-- Session 持久化（记住登录状态）：暂不实现
 
 ---
 
@@ -274,92 +284,75 @@ class I18nEntry:
 
 ### 子命令
 
-#### `query` — 查询 i18n key
+#### `query` — 查询 i18n key，输出 JSON
 
 ```bash
 happyhappyhappy --cli query \
-  --texts '["确认订单", "取消", "支付金额"]' \
-  --cookie 'csrftoken=xxx; sessionid=xxx' \
-  --csrf 'xxx' \
+  --texts-file texts.json \
+  --use-saved-creds \
+  [--same-interface] \
   [--output result.json]
 ```
 
-| 参数 | 说明 | 必填 |
-|------|------|------|
-| `--texts` | JSON 数组字符串，包含待查中文列表 | 是 |
-| `--texts-file` | 或传文件路径，文件内容为 `{"texts": [...]}` 格式 | 二选一 |
-| `--cookie` | Archery session cookie 字符串 | 是 |
-| `--csrf` | csrftoken 值 | 是 |
-| `--output` | 结果输出路径（JSON），默认输出到 stdout | 否 |
+#### `export` — 将查询 JSON 导出为 CSV
 
-**输出格式（JSON）：**
-
-```json
-{
-  "results": [
-    {
-      "zh_cn": "确认订单",
-      "status": "found",
-      "trip_appid": "100023153",
-      "key": "pos.order.confirm",
-      "en_us": "Confirm Order"
-    },
-    {
-      "zh_cn": "取消",
-      "status": "ambiguous",
-      "candidates": [
-        {"trip_appid": "100023153", "key": "common.cancel", "en_us": "Cancel"},
-        {"trip_appid": "100023154", "key": "pos.cancel", "en_us": "Cancel"}
-      ]
-    },
-    {
-      "zh_cn": "支付金额",
-      "status": "not_found"
-    }
-  ]
-}
-```
-
-#### `export` — 将查询结果导出为 CSV
+输入必须是 `query` 产出的 JSON，不接受 CSV。
 
 ```bash
 happyhappyhappy --cli export \
   --input result.json \
-  --output output.csv
+  --output output.csv \
+  [--ambiguous all|skip]   # 默认 all
 ```
 
-歧义项（`status: ambiguous`）在导出时，若未经人工确认则跳过，或写入所有候选行（`status` 标记为 `ambiguous`），由 `--ambiguous` 参数控制：
+#### `import` — 处理研发确认后的 CSV，输出干净 CSV
+
+研发在 CSV 里删掉歧义行的多余候选，只保留正确的一行后发回。此命令重新处理：
+- 某中文只剩 1 行 ambiguous → 升级为 `confirmed`
+- 仍有多行 → 保持 `ambiguous`
 
 ```bash
-# 跳过歧义项（默认）
-happyhappyhappy --cli export --input result.json --output out.csv --ambiguous skip
-
-# 写入全部候选行
-happyhappyhappy --cli export --input result.json --output out.csv --ambiguous all
+happyhappyhappy --cli import \
+  --input dev_confirmed.csv \
+  --output final.csv
 ```
 
-#### `full` — 一键完成查询 + 导出
+#### `full` — 一步完成查询 + 导出 CSV
 
 ```bash
 happyhappyhappy --cli full \
   --texts-file texts.json \
-  --cookie 'csrftoken=xxx; sessionid=xxx' \
-  --csrf 'xxx' \
-  --output output.csv
+  --use-saved-creds \
+  --output output.csv \
+  [--same-interface] \
+  [--ambiguous all|skip]
 ```
 
-等同于依次执行 `query` + `export`，结果直接写成 CSV，无需中间 JSON 文件。
+#### 认证参数（`query` / `full` 三选一）
+
+| 参数 | 说明 |
+|------|------|
+| `--use-saved-creds` | 使用 `~/.happyhappyhappy/credentials.json` 中保存的账密（推荐） |
+| `--username` / `--password` | 直接传入账密 |
+| `--cookie` + `--csrf` | 直接传入已有 session cookie（高级用法） |
+| `--save-creds` | 登录成功后将账密保存到本地 |
+
+#### `--same-interface` 参数说明
+
+当截图中所有词条来自同一个接口时，加此参数：
+
+- 工具用已 `found` 条目的 `trip_appid` 过滤歧义候选
+- 同一中文只剩 1 个候选 → 自动升级为 `found`
+- 若 `found` 条目本身 appid 不一致 → 输出警告"同一接口返回的 trip_appid 不同"，不自动处理
 
 ### 典型 AI 调用流程
 
 ```
 1. AI 识图，提取中文列表，写入 texts.json
-2. AI 读取用户本地存储的 cookie（或提示用户登录并提供 cookie）
-3. AI 调用：happyhappyhappy --cli full --texts-file texts.json --cookie '...' --csrf '...' --output result.csv
-4. AI 返回 result.csv 路径，或直接读取内容展示给用户
+2. AI 询问用户：这些文本是否来自同一接口？
+3. AI 调用：happyhappyhappy --cli full --texts-file texts.json --use-saved-creds [--same-interface] --output result.csv
+4. AI 读取 result.csv，在对话中汇报结果
 ```
-
-> **注意**：cookie 有效期有限，AI 工具需在调用前确认 session 仍有效，失效后提示用户重新登录并更新 cookie。
 
 # 打包命令
 ```bash
