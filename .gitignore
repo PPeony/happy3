@@ -5,3 +5,6 @@ dist/
 build/
 *.egg-info/
 .env
+
+# 本地凭据，不进 git
+.happyhappyhappy/

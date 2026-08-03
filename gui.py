@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 
 import flet as ft
 
 from archery import ArcheryQueryError, ArcherySession, LoginError, SessionExpiredError, login
 from cli import entries_to_csv, entries_from_csv
 from credentials import load as creds_load, save as creds_save, cred_path, clear as creds_clear
+from feishu import FeishuClient, FeishuError
+from feishu_config import load as feishu_cfg_load, save as feishu_cfg_save, config_path as feishu_cfg_path
 from models import I18nEntry
 
 COL_ZH    = 160
@@ -190,6 +194,17 @@ class MainView(ft.View):
 
         self._file_picker_save = ft.FilePicker(on_result=self._on_save_picked)
         self._file_picker_open = ft.FilePicker(on_result=self._on_import_picked)
+        self._file_picker_screenshot = ft.FilePicker(on_result=self._on_screenshot_picked)
+        self._pending_screenshot_path: str | None = None
+
+        self._feishu_btn = ft.ElevatedButton(
+            "上传飞书", icon=ft.icons.CLOUD_UPLOAD,
+            on_click=self._open_feishu_dialog, disabled=True,
+            style=ft.ButtonStyle(
+                bgcolor={"": "#0052D9", "disabled": "#B0BAC8"},
+                color={"": "#FFFFFF"},
+            ),
+        )
 
         super().__init__(
             route="/",
@@ -221,7 +236,7 @@ class MainView(ft.View):
                         self._result_list,
                         ft.Divider(color="#E0E0E0"),
                         ft.Row(
-                            [self._import_btn, self._export_btn],
+                            [self._import_btn, self._export_btn, self._feishu_btn],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         ),
                     ], expand=True, spacing=8),
@@ -379,6 +394,7 @@ class MainView(ft.View):
         self._result_list.controls = rows
         self._result_header.visible = bool(self._entries)
         self._export_btn.disabled = not bool(self._entries)
+        self._feishu_btn.disabled = not bool(self._entries)
         self._page.update()
 
     # --- Export / Import ---
@@ -428,6 +444,182 @@ class MainView(ft.View):
         except Exception as ex:
             self._snack(f"导入失败：{ex}", error=True)
 
+    # --- Feishu Upload ---
+
+    def _open_feishu_dialog(self, _):
+        saved = feishu_cfg_load()
+
+        app_id_field = ft.TextField(
+            label="飞书 App ID",
+            value=saved.get("app_id", ""),
+            autofocus=not bool(saved.get("app_id")),
+            text_style=ft.TextStyle(color="#1A1A2E"),
+        )
+        app_secret_field = ft.TextField(
+            label="飞书 App Secret",
+            password=True, can_reveal_password=True,
+            value=saved.get("app_secret", ""),
+            autofocus=bool(saved.get("app_id")),
+            text_style=ft.TextStyle(color="#1A1A2E"),
+        )
+        folder_token_field = ft.TextField(
+            label="文件夹 Token（强烈建议填写）",
+            value=saved.get("folder_token", ""),
+            hint_text="从文件夹 URL 获取：.../drive/folder/fldcnXXX",
+            helper_text="填写后文件创建在你自己的文件夹里，你拥有编辑权限",
+            helper_style=ft.TextStyle(color="#888888", size=11),
+            text_style=ft.TextStyle(color="#1A1A2E"),
+        )
+        title_field = ft.TextField(
+            label="表格标题（留空自动生成）",
+            hint_text="i18n词条校验_20260731_1430",
+            text_style=ft.TextStyle(color="#1A1A2E"),
+        )
+        remember_cb = ft.Checkbox(
+            label="记住 App ID / App Secret",
+            value=bool(saved),
+            label_style=ft.TextStyle(color="#444444", size=13),
+        )
+        use_user_token_cb = ft.Checkbox(
+            label="用我的飞书账号授权（推荐，文件所有者为你本人）",
+            value=True,
+            label_style=ft.TextStyle(color="#1565C0", size=13),
+        )
+        saved_hint = ft.Text(
+            f"已读取保存的飞书配置（{feishu_cfg_path()}）",
+            size=11, color="#888888", visible=bool(saved),
+        )
+
+        # 截图选择区域
+        self._pending_screenshot_path = None
+        screenshot_label = ft.Text(
+            "未选择截图（可选）", size=12, color="#888888", italic=True,
+        )
+        select_screenshot_btn = ft.OutlinedButton(
+            "选择截图", icon=ft.icons.IMAGE,
+            style=ft.ButtonStyle(
+                side={"": ft.BorderSide(1, "#1565C0")},
+                color={"": "#1565C0"},
+            ),
+        )
+
+        def _pick_screenshot(_):
+            # 先暂存对话框引用，截图选好后继续
+            self._file_picker_screenshot.pick_files(
+                dialog_title="选择界面截图",
+                allowed_extensions=["png", "jpg", "jpeg", "gif", "bmp", "webp"],
+                allow_multiple=False,
+            )
+
+        select_screenshot_btn.on_click = _pick_screenshot
+
+        # 截图回调需要能更新这个 label，存到实例方便 _on_screenshot_picked 访问
+        self._screenshot_label_ref = screenshot_label
+
+        error_text = ft.Text("", color="#C62828", size=12, visible=False)
+        progress   = ft.ProgressRing(visible=False, width=18, height=18)
+        upload_btn = ft.ElevatedButton(
+            "上传",
+            style=ft.ButtonStyle(bgcolor={"": "#0052D9"}, color={"": "#FFFFFF"}),
+        )
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("上传到飞书多维表格", color="#1A1A2E"),
+            bgcolor="#FFFFFF",
+            content=ft.Column(
+                [
+                    app_id_field,
+                    app_secret_field,
+                    folder_token_field,
+                    title_field,
+                    ft.Row([select_screenshot_btn, screenshot_label], spacing=12,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    use_user_token_cb,
+                    remember_cb,
+                    saved_hint,
+                    error_text,
+                ],
+                tight=True, spacing=8, width=380,
+            ),
+            actions=[
+                progress,
+                ft.TextButton("取消", on_click=lambda _: self._close_dialog(dlg)),
+                upload_btn,
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        async def do_upload(_):
+            error_text.visible = False
+            upload_btn.disabled = True
+            progress.visible = True
+            self._page.update()
+
+            aid    = (app_id_field.value or "").strip()
+            asec   = (app_secret_field.value or "").strip()
+            ftoken = (folder_token_field.value or "").strip()
+            ttitle = (title_field.value or "").strip() or None
+
+            if not aid or not asec:
+                error_text.value = "请填写 App ID 和 App Secret"
+                error_text.visible = True
+                upload_btn.disabled = False
+                progress.visible = False
+                self._page.update()
+                return
+
+            if remember_cb.value:
+                feishu_cfg_save(aid, asec, folder_token=ftoken)
+
+            screenshot = self._pending_screenshot_path
+
+            try:
+                client = FeishuClient(
+                    app_id=aid,
+                    app_secret=asec,
+                    use_user_token=use_user_token_cb.value,
+                )
+                url = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: client.create_and_upload(
+                        self._entries,
+                        title=ttitle,
+                        screenshot_path=screenshot,
+                        folder_token=ftoken,
+                    )
+                )
+                self._close_dialog(dlg)
+                self._snack(f"上传成功！链接已复制：{url}")
+                self._page.set_clipboard(url)
+            except FeishuError as e:
+                error_text.value = f"飞书错误：{e}"
+                error_text.visible = True
+                upload_btn.disabled = False
+                progress.visible = False
+                self._page.update()
+            except Exception as e:
+                error_text.value = f"网络错误：{e}"
+                error_text.visible = True
+                upload_btn.disabled = False
+                progress.visible = False
+                self._page.update()
+
+        upload_btn.on_click = do_upload
+        self._page.dialog = dlg
+        dlg.open = True
+        self._page.update()
+
+    def _on_screenshot_picked(self, e):
+        if e.files:
+            self._pending_screenshot_path = e.files[0].path
+            name = e.files[0].name
+            if hasattr(self, "_screenshot_label_ref"):
+                self._screenshot_label_ref.value = f"已选：{name}"
+                self._screenshot_label_ref.color = "#2E7D32"
+                self._screenshot_label_ref.italic = False
+                self._page.update()
+
     # --- Helpers ---
 
     def _snack(self, msg, error=False):
@@ -452,6 +644,7 @@ def run_gui():
         main_view = MainView(page)
         page.overlay.append(main_view._file_picker_save)
         page.overlay.append(main_view._file_picker_open)
+        page.overlay.append(main_view._file_picker_screenshot)
         page.views.clear()
         page.views.append(main_view)
         page.update()

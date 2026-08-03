@@ -9,7 +9,6 @@ on:
 jobs:
   # --------------------------------------------------
   # Windows 打包
-  # 使用 flet pack（基于 PyInstaller）
   # --------------------------------------------------
   build-windows:
     runs-on: windows-latest
@@ -26,6 +25,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Write Feishu credentials
+        shell: pwsh
+        env:
+          FEISHU_APP_ID:     ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          $dir = "$env:USERPROFILE\.happyhappyhappy"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          [PSCustomObject]@{
+            app_id     = $env:FEISHU_APP_ID
+            app_secret = $env:FEISHU_APP_SECRET
+          } | ConvertTo-Json | Set-Content "$dir\feishu.json" -Encoding UTF8
+
       - name: Build Windows exe
         run: flet pack main.py --name "happyhappyhappy" --icon "img/app.ico"
 
@@ -33,13 +45,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: happyhappyhappy-windows
-          # flet pack 产物默认在 dist/ 目录
           path: dist/happyhappyhappy.exe
           retention-days: 30
 
   # --------------------------------------------------
   # macOS 打包
-  # ico -> icns 转换后再 flet pack
   # --------------------------------------------------
   build-macos:
     runs-on: macos-latest
@@ -58,9 +68,18 @@ jobs:
           pip install -r requirements.txt pyinstaller
           pip install Pillow
 
+      - name: Write Feishu credentials
+        env:
+          FEISHU_APP_ID:     ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          mkdir -p ~/.happyhappyhappy
+          printf '{"app_id":"%s","app_secret":"%s"}' \
+            "$FEISHU_APP_ID" "$FEISHU_APP_SECRET" \
+            > ~/.happyhappyhappy/feishu.json
+
       - name: Convert ico to icns
         run: |
-          # 把 ico 转成 png，再用 iconutil 生成 icns
           mkdir -p img/app.iconset
           python3 - << 'EOF'
           from PIL import Image
@@ -119,3 +138,4 @@ jobs:
             dist/happyhappyhappy.exe
             dist/happyhappyhappy-macos.zip
           generate_release_notes: true
+

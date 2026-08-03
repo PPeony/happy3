@@ -12,12 +12,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import defaultdict
 from typing import Literal
 
 from archery import ArcheryQueryError, ArcherySession, LoginError, SessionExpiredError, login
 from credentials import load as creds_load, save as creds_save, cred_path
+from feishu import FeishuClient, FeishuError
+from feishu_config import load as feishu_cfg_load, save as feishu_cfg_save, config_path as feishu_cfg_path
 from models import Candidate, I18nEntry
 
 CSV_FIELDNAMES = ["trip_appid", "key", "zh_cn", "en_us", "image_url", "status", "note"]
@@ -284,6 +287,45 @@ def _get_session(args: argparse.Namespace) -> ArcherySession:
     return session
 
 
+def _get_feishu_client(args: argparse.Namespace) -> FeishuClient:
+    """从参数或保存的配置中构建 FeishuClient。"""
+    app_id     = getattr(args, "feishu_app_id",     None)
+    app_secret = getattr(args, "feishu_app_secret", None)
+
+    if not app_id or not app_secret:
+        if getattr(args, "use_saved_feishu", False):
+            saved = feishu_cfg_load()
+            if not saved.get("app_id") or not saved.get("app_secret"):
+                print(f"Error: no saved Feishu config at {feishu_cfg_path()}", file=sys.stderr)
+                sys.exit(1)
+            app_id     = saved["app_id"]
+            app_secret = saved["app_secret"]
+            print(f"[feishu] using saved config for app_id: {app_id}")
+        else:
+            print("Error: provide --feishu-app-id/--feishu-app-secret or --use-saved-feishu",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    if getattr(args, "save_feishu", False):
+        feishu_cfg_save(
+            app_id,
+            app_secret,
+            folder_token=getattr(args, "folder_token", "") or "",
+        )
+        print(f"[feishu] config saved to {feishu_cfg_path()}")
+
+    use_user_token = getattr(args, "user_token", True)   # 默认用 user token
+    force_reauth   = getattr(args, "reauth", False)
+    # 使用内置凭据（app_id/app_secret 已硬编码在 feishu.py 中）
+    from feishu import FEISHU_APP_ID, FEISHU_APP_SECRET
+    return FeishuClient(
+        app_id=FEISHU_APP_ID,
+        app_secret=FEISHU_APP_SECRET,
+        use_user_token=use_user_token,
+        force_reauth=force_reauth,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sub-commands
 # ---------------------------------------------------------------------------
@@ -395,6 +437,75 @@ def cmd_full(args: argparse.Namespace) -> None:
     print(f"Exported {written} rows -> {args.output}")
 
 
+def cmd_upload(args: argparse.Namespace) -> None:
+    """
+    将查询结果 JSON 上传到飞书多维表格，输出在线链接。
+
+    典型调用（豆包 AI 识图后直接驱动）：
+        happyhappyhappy --cli upload \\
+            --input result.json \\
+            --screenshot ui_screenshot.png \\
+            --use-saved-feishu
+    """
+    # 读取查询结果（支持 JSON 和 CSV 两种格式）
+    if args.input.lower().endswith(".csv"):
+        entries = entries_from_csv(args.input)
+    else:
+        with open(args.input, encoding="utf-8") as f:
+            data = json.load(f)
+        entries = entries_from_json(data)
+
+    if not entries:
+        print("Error: no entries in input file", file=sys.stderr)
+        sys.exit(1)
+
+    # 截图路径校验（可选）
+    screenshot_path: str | None = getattr(args, "screenshot", None)
+    if screenshot_path and not os.path.isfile(screenshot_path):
+        print(f"Error: screenshot file not found: {screenshot_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # 构建飞书客户端
+    client = _get_feishu_client(args)
+
+    # 表格标题
+    title = getattr(args, "title", None) or None  # None 时 feishu.py 自动用时间戳
+
+    print(f"[feishu] uploading {len(entries)} entries...")
+    if screenshot_path:
+        print(f"[feishu] screenshot: {screenshot_path}")
+
+    # 获取 folder_token（优先命令行参数，其次保存的配置）
+    folder_token = getattr(args, "folder_token", None) or ""
+    if not folder_token and getattr(args, "use_saved_feishu", False):
+        folder_token = feishu_cfg_load().get("folder_token", "")
+    if not folder_token:
+        print("[feishu] WARNING: 未指定 --folder-token，文件将创建在机器人空间，"
+              "你可能没有编辑权限。建议传入 --folder-token 指定你自己的云空间文件夹。",
+              file=sys.stderr)
+
+    try:
+        url = client.create_and_upload(
+            entries,
+            title=title,
+            screenshot_path=screenshot_path,
+            folder_token=folder_token,
+        )
+    except FeishuError as e:
+        print(f"Feishu error: {e}", file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(f"Network error: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    print(f"[feishu] Done! 在线链接：{url}")
+    # 同时写到 --output 文件（若指定）
+    if getattr(args, "output", None):
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(url + "\n")
+        print(f"[feishu] link saved to {args.output}")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -444,6 +555,36 @@ def run_cli(argv=None) -> None:
     p_full.add_argument("--ambiguous", choices=["skip", "all"], default="all")
     _add_auth_args(p_full)
 
+    p_upload = sub.add_parser("upload", help="upload query result JSON to Feishu Bitable")
+    p_upload.add_argument("--input",        required=True,
+                          help="JSON or CSV file from `query` / `full` command")
+    p_upload.add_argument("--screenshot",   default=None,
+                          help="local screenshot image path (optional, shared across all rows)")
+    p_upload.add_argument("--title",        default=None,
+                          help="Bitable title (default: auto-generated with timestamp)")
+    p_upload.add_argument("--folder-token", dest="folder_token", default=None,
+                          help="飞书云空间目标文件夹 token（从文件夹 URL 获取：.../drive/folder/fldcnXXX）"
+                               "。填写后文件创建在你自己的文件夹里，你拥有编辑权限。")
+    p_upload.add_argument("--output",       default=None,
+                          help="write the Feishu URL to this file (optional)")
+    g_feishu = p_upload.add_argument_group("feishu auth (pick one)")
+    g_feishu.add_argument("--feishu-app-id",     dest="feishu_app_id",
+                          help="Feishu app_id")
+    g_feishu.add_argument("--feishu-app-secret", dest="feishu_app_secret",
+                          help="Feishu app_secret")
+    g_feishu.add_argument("--use-saved-feishu",  dest="use_saved_feishu",
+                          action="store_true",
+                          help="use saved config from ~/.happyhappyhappy/feishu.json")
+    g_feishu.add_argument("--save-feishu",       dest="save_feishu",
+                          action="store_true",
+                          help="save app_id/app_secret after successful use")
+    g_feishu.add_argument("--user-token",        dest="user_token",
+                          action="store_true",
+                          help="使用 user_access_token（OAuth 浏览器授权），文件所有者为你本人（推荐）")
+    g_feishu.add_argument("--reauth",            dest="reauth",
+                          action="store_true",
+                          help="强制重新进行 OAuth 授权（清除缓存的 user token）")
+
     args = parser.parse_args(argv)
     if args.command == "query":
         cmd_query(args)
@@ -453,3 +594,5 @@ def run_cli(argv=None) -> None:
         cmd_import(args)
     elif args.command == "full":
         cmd_full(args)
+    elif args.command == "upload":
+        cmd_upload(args)

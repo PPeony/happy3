@@ -260,9 +260,116 @@ class Candidate:
 
 ---
 
+## 飞书多维表格上传
+
+### 背景
+
+词条校验完成后，copywriter 需要把结果（含截图）提交给飞书 copywriter 系统。本功能支持将查询结果一键上传为飞书在线多维表格，并可附带界面截图。
+
+### 技术选型：多维表格（Bitable）
+
+选择多维表格而非电子表格，原因：
+- 附件字段天然支持图片，点击可全屏预览
+- 可切换"画册视图"，以截图为主视觉浏览
+- 结构化字段与 CSV 列完美对应
+- 电子表格的单元格图片不能与文字共存，体验差
+
+### 飞书应用权限要求
+
+在飞书开发者后台 [open.feishu.cn/app](https://open.feishu.cn/app) 创建自建应用，申请以下权限：
+
+| 权限 scope | 用途 | 是否必须 |
+|---|---|---|
+| `bitable:app` | 创建多维表格、字段、批量写记录 | 必须 |
+| `drive:drive` | 上传截图图片，获取 file_token | 有截图时必须 |
+
+### 凭据说明
+
+飞书 `app_id` 和 `app_secret` **已硬编码在代码中**（`feishu.py` / `feishu_auth.py`），打包后无需用户填写。用户只需在首次使用时通过浏览器 OAuth 授权一次，token 自动缓存 30 天并刷新。
+
+user token 缓存于 `~/.happyhappyhappy/feishu_user_token.json`。`feishu_config.py` 保留，仅用于可选的 `folder_token` 配置。
+
+### API 调用链路（3 步）
+
+```
+Step 1: POST /auth/v3/tenant_access_token/internal
+        → tenant_access_token（有效期 2h，运行期间缓存）
+
+Step 2（有截图时）: POST /drive/v1/medias/upload_all
+        parent_type=bitable_image, parent_node=<app_token>
+        → file_token
+
+Step 3: POST /bitable/v1/apps                          建表
+        POST /bitable/v1/apps/:token/tables/:id/fields  建字段（7个）
+        POST /bitable/v1/apps/:token/tables/:id/records/batch_create  写记录
+        → 在线链接 URL
+```
+
+多维表格字段定义：
+
+| 字段名 | 类型 | 说明 |
+|---|---|---|
+| zh_cn | 文本(1) | 中文原文 |
+| key | 文本(1) | i18n key |
+| trip_appid | 文本(1) | 携程应用 ID |
+| en_us | 文本(1) | 英文译文 |
+| status | 文本(1) | found / not_found / ambiguous / confirmed |
+| note | 文本(1) | 歧义行填"待研发确认" |
+| 截图 | 附件(17) | 界面截图，所有记录共享同一张图 |
+
+歧义条目（ambiguous）展开为多行写入，与 CSV 导出逻辑一致。
+
+### GUI 操作
+
+查询完成后，"导出 CSV"旁新增"**上传飞书**"按钮：
+1. 点击弹出对话框，填写 App ID / App Secret（支持记住）
+2. 可选择本地截图文件（所有记录共享同一张）
+3. 可自定义表格标题（留空自动生成时间戳标题）
+4. 上传成功后 SnackBar 提示链接，并自动复制到剪贴板
+
+### CLI `upload` 子命令
+
+```bash
+happyhappyhappy --cli upload \
+  --input result.json \
+  [--screenshot ui_screenshot.png] \
+  [--title "POS收银台词条_20260731"] \
+  [--output link.txt] \
+  --use-saved-feishu
+```
+
+认证参数（三选一）：
+
+| 参数 | 说明 |
+|---|---|
+| `--use-saved-feishu` | 使用 `~/.happyhappyhappy/feishu.json` 中保存的凭据（推荐） |
+| `--feishu-app-id` + `--feishu-app-secret` | 直接传入 |
+| `--save-feishu` | 本次登录后将凭据保存到本地 |
+
+### 典型豆包 AI 调用流程（含截图）
+
+```
+1. 豆包识图，提取中文列表，写入 texts.json
+2. 豆包将截图保存到本地，如 /tmp/ui_screenshot.png
+3. 豆包询问用户：这些文本是否来自同一接口？
+4. 豆包调用查询：
+   happyhappyhappy --cli query \
+     --texts-file texts.json \
+     --use-saved-creds [--same-interface] \
+     --output result.json
+5. 豆包调用上传：
+   happyhappyhappy --cli upload \
+     --input result.json \
+     --screenshot /tmp/ui_screenshot.png \
+     --use-saved-feishu
+6. 豆包读取输出的飞书链接，在对话中汇报给用户
+```
+
+---
+
 ## 待定/超出范围
 
-- 图片 URL 字段：暂不实现，CSV 中留空
+- 图片 URL 字段：CSV 中留空（飞书多维表格已通过附件字段承载截图，CSV 不需要）
 
 ---
 
@@ -329,6 +436,19 @@ happyhappyhappy --cli full \
   [--ambiguous all|skip]
 ```
 
+#### `upload` — 将查询 JSON 上传到飞书多维表格
+
+```bash
+happyhappyhappy --cli upload \
+  --input result.json \
+  [--screenshot ui_screenshot.png] \
+  [--title "表格标题"] \
+  [--output link.txt] \
+  --use-saved-feishu
+```
+
+输出飞书在线链接到 stdout，`--output` 可选择同时写入文件。
+
 #### 认证参数（`query` / `full` 三选一）
 
 | 参数 | 说明 |
@@ -367,8 +487,8 @@ git push origin v1.0.0
 
 测试
 ```bash
-# ut
-pytest tests/test_cli.py -v 
-# 端到端
-pytest tests/test_cli.py -m integration -v    
+# 单元测试
+pytest tests/test_cli.py tests/test_feishu.py -v
+# 端到端（需内网 + 保存凭据）
+pytest tests/test_cli.py -m integration -v
 ```
