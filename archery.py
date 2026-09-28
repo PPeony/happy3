@@ -11,7 +11,7 @@ from typing import Any
 
 import requests
 
-from models import Candidate, I18nEntry
+from models import Candidate, I18nEntry, KeyMatch
 
 ARCHERY_BASE = "http://archery.rezen.work"
 LOGIN_URL = f"{ARCHERY_BASE}/login/"
@@ -19,6 +19,21 @@ QUERY_URL = f"{ARCHERY_BASE}/query/"
 QUERY_INSTANCE = "OL_SET_PMS_RO"
 QUERY_DB = "pms_i18n"
 LIMIT = 1000
+
+# key 反查 appId 时每条 SQL 带多少个 key（IN 列表别太长）
+KEY_BATCH = 500
+
+# 纯数字 key 用 LIKE 找真身，一条 SQL 里的 OR 数量
+NUMERIC_BATCH = 100
+
+# 纯数字 key 的匹配顺序（真身形态已确认：形如 reception_error_10194060，数字在末尾、前面有下划线）。
+# 按可能性从高到低依次试，前一趟没命中的 key 才进下一趟。
+#   SQL 模式里 % 是通配符，\_ 才是字面下划线（要和 Python 侧的判定一致）
+NUMERIC_PASSES = (
+    ("带下划线的后缀", "%\\_{key}", lambda doc_key, real_key: real_key.endswith("_" + doc_key)),
+    ("任意字符的后缀", "%{key}", lambda doc_key, real_key: real_key.endswith(doc_key)),
+    ("包含", "%{key}%", lambda doc_key, real_key: doc_key in real_key),
+)
 
 # trip_appid 白名单，只保留在此列表中的词条
 APPID_WHITELIST = {
@@ -231,6 +246,96 @@ WHERE zh.language_cd = 'zh-CN'
                 ))
 
         return results
+
+    def query_appid_by_keys(self, keys: list[str]) -> dict[str, KeyMatch]:
+        """
+        用 key 批量反查 trip_appid（链路 B），返回 {文档里的 key: KeyMatch}。
+
+        两种 key 走两条路：
+
+        1. **普通 key**：精确匹配（`key IN (...)`）；
+        2. **纯数字 key**：文档里写的是**截断过的前缀**（错误码那种长 key 只留了前几位），
+           所以用 `LIKE '前缀%'` 找真身，并把真身 full key 记在 `KeyMatch.real_key` 里——
+           写进 shark 导入文件的必须是真身，写截断值会更新到错误的词条上。
+           前缀里不会有 `%` / `_`（都是数字），所以不用额外转义通配符。
+
+        两种情况都保留"不自动选"的原则：命中多个 appId（或数字 key 命中多个真身）时
+        只记录候选，由调用方计入报告交人工判断。`KeyMatch` 一定会有条目返回（哪怕 appId 为空）。
+        """
+        wanted = list(dict.fromkeys(k.strip() for k in keys if k and k.strip()))
+        matches: dict[str, KeyMatch] = {k: KeyMatch(doc_key=k) for k in wanted}
+        numeric = [k for k in wanted if k.isdigit()]
+        plain = [k for k in wanted if not k.isdigit()]
+
+        # 库里的写法可能和文档不同（大小写差异，MySQL 默认大小写不敏感所以照样能查到），
+        # 所以要能把"库里返回的 key"映射回"文档里的 key"，并把库里的写法记成 real_key。
+        by_lower: dict[str, str] = {}
+        for k in wanted:
+            by_lower.setdefault(k.lower(), k)
+
+        # 1) 普通 key：精确匹配。
+        #    不按 language_cd 过滤——appId 跟语种无关，而 DISTINCT trip_appid, key 之后结果集大小一样；
+        #    加上语种过滤反而会让"只有非 zh-CN 行"的词条被漏掉（这类 key 同样要能导出去）。
+        for start in range(0, len(plain), KEY_BATCH):
+            batch = plain[start:start + KEY_BATCH]
+            in_clause = ", ".join(f"'{self._escape(k)}'" for k in batch)
+            sql = f"""
+SELECT DISTINCT trip_appid, `key`
+FROM i18n_translated_message
+WHERE `key` IN ({in_clause})
+""".strip()
+
+            for row in self._parse_rows(self._post_sql(sql)):
+                returned_key = str(row.get("key") or "").strip()
+                appid = str(row.get("trip_appid") or "").strip()
+                if not returned_key or not appid:
+                    continue
+                doc_key = by_lower.get(returned_key.lower())
+                match = matches.get(doc_key) if doc_key else None
+                if match is None:
+                    continue
+                if appid not in match.appids:
+                    match.appids.append(appid)
+                match.real_key = returned_key        # 库里真正的写法
+
+        # 2) 纯数字 key：文档里只留了截断后的一段数字，按 NUMERIC_PASSES 的顺序找真身
+        for _label, pattern, hit in NUMERIC_PASSES:
+            missed = [k for k in numeric if not matches[k].candidates]
+            if not missed:
+                break
+            for start in range(0, len(missed), NUMERIC_BATCH):
+                batch = missed[start:start + NUMERIC_BATCH]
+                where = " OR ".join(
+                    f"`key` LIKE '{pattern.format(key=self._escape(k))}'" for k in batch
+                )
+                sql = f"""
+SELECT DISTINCT trip_appid, `key`
+FROM i18n_translated_message
+WHERE ({where})
+""".strip()
+
+                for row in self._parse_rows(self._post_sql(sql)):
+                    real_key = str(row.get("key") or "").strip()
+                    appid = str(row.get("trip_appid") or "").strip()
+                    if not real_key or not appid:
+                        continue
+                    for doc_key in batch:
+                        if not hit(doc_key, real_key):
+                            continue
+                        match = matches[doc_key]
+                        appids = match.candidates.setdefault(real_key, [])
+                        if appid not in appids:
+                            appids.append(appid)
+
+        # 数字 key 收敛：只有一个真身才算数，多个真身留给人工判断
+        for doc_key in numeric:
+            match = matches[doc_key]
+            if len(match.candidates) == 1:
+                real_key, appids = next(iter(match.candidates.items()))
+                match.real_key = real_key
+                match.appids = list(appids)
+
+        return matches
 
 
 class SessionExpiredError(Exception):

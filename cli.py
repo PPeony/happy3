@@ -2,10 +2,16 @@
 cli.py - command line interface
 
 Subcommands:
-  query   -- query Archery, output JSON
-  export  -- convert query JSON to CSV
-  import  -- process developer-edited CSV, output clean CSV
-  full    -- query + export in one step
+  query        -- query Archery, output JSON
+  export       -- convert query JSON to CSV
+  import       -- process developer-edited CSV, output clean CSV
+  full         -- query + export in one step
+  docx-titles  -- list / fuzzy-search section titles in the RezenOne docx
+  shark-export -- build shark import xlsx files (one per appId) from a docx table
+  doc-submit   -- append the check result as a table into an existing Feishu doc
+
+`upload`（上传飞书多维表格）已移除：载体选错了，要求是写进对应格式的飞书文档。
+2026-09-28 重启，新入口是 `doc-submit`（docx 块），详见 doc/spec.md 的"飞书结果提交（重启中）"。
 """
 from __future__ import annotations
 
@@ -14,14 +20,67 @@ import csv
 import json
 import os
 import sys
+from datetime import datetime
 from collections import defaultdict
 from typing import Literal
 
+import shark
 from archery import ArcheryQueryError, ArcherySession, LoginError, SessionExpiredError, login
 from credentials import load as creds_load, save as creds_save, cred_path
-from feishu import FeishuClient, FeishuError
-from feishu_config import load as feishu_cfg_load, save as feishu_cfg_save, config_path as feishu_cfg_path
-from models import Candidate, I18nEntry
+import feishu_doc
+from docx_table import DocxColumnError, DocxError, TableNotFoundError, load_document
+from models import EXPECTED_COLUMNS, Candidate, I18nEntry
+
+def _tool_dir() -> str:
+    """工具所在目录：打包后是 exe 所在目录，开发时是本文件所在目录"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _search_bases() -> list[tuple[str, str]]:
+    """
+    默认文件的查找位置，按优先级返回 [(说明, 目录)]。
+
+    为什么要找这么多地方：工具会进 PATH、也可能从 dist/ 里被调用，
+    而 doc/ 通常在仓库根目录（也就是 exe 的上一级），只按 cwd 解析必然找不到。
+    """
+    bases: list[tuple[str, str]] = []
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:                                  # --add-data 打进 exe 的文件
+        bases.append(("打包内", meipass))
+
+    tool_dir = _tool_dir()
+    bases.append(("工具安装目录", tool_dir))
+
+    parent = os.path.dirname(tool_dir)           # exe 在 dist/ 时，doc/ 在它上一级
+    if parent and parent != tool_dir:
+        bases.append(("安装目录的上一级", parent))
+
+    bases.append(("当前工作目录", os.getcwd()))
+    return bases
+
+
+def candidate_paths(rel_path: str) -> list[str]:
+    """要找一个默认文件时，实际会查哪些绝对路径（报错信息里用）"""
+    return [os.path.join(base, rel_path) for _, base in _search_bases()]
+
+
+def _first_existing(rel_path: str) -> str:
+    """按 _search_bases() 的顺序找第一个存在的文件；都没有就返回安装目录下的路径（报错时给人看）"""
+    for candidate in candidate_paths(rel_path):
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(_tool_dir(), rel_path)
+
+
+_DOC_REL = os.path.join("doc", "RezenOne翻译需求.docx")
+
+# 词条表有 135MB，放在程序旁边（或用 --doc 指定）；shark 模板是常量，已内嵌在 shark_template.py 里
+DEFAULT_DOCX = _first_existing(_DOC_REL)
+DEFAULT_OUTDIR = "shark_import"
+
 
 CSV_FIELDNAMES = ["trip_appid", "key", "zh_cn", "en_us", "image_url", "status", "note"]
 
@@ -247,7 +306,15 @@ def _parse_sessionid(cookie_str: str) -> str:
     raise ValueError(f"sessionid not found in cookie: {cookie_str!r}")
 
 
-def _get_session(args: argparse.Namespace) -> ArcherySession:
+def _get_session(args: argparse.Namespace, result_path: str | None = None) -> ArcherySession:
+    """登录 Archery。result_path 给了就把登录失败也写进结果文件（stdout/stderr 可能不可用）"""
+
+    def _die(message: str, code: int):
+        if result_path:
+            _fail(message, result_path, code)
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(code)
+
     if getattr(args, "cookie", None) and getattr(args, "csrf", None):
         return ArcherySession(
             csrftoken=args.csrf,
@@ -261,24 +328,19 @@ def _get_session(args: argparse.Namespace) -> ArcherySession:
         if getattr(args, "use_saved_creds", False):
             saved = creds_load()
             if not saved:
-                print(f"Error: no saved credentials at {cred_path()}", file=sys.stderr)
-                sys.exit(1)
+                _die(f"no saved credentials at {cred_path()}", 1)
             username = saved["username"]
             password = saved["password"]
             print(f"[creds] using saved credentials for user: {username}")
         else:
-            print("Error: provide --cookie/--csrf, --username/--password, or --use-saved-creds",
-                  file=sys.stderr)
-            sys.exit(1)
+            _die("provide --cookie/--csrf, --username/--password, or --use-saved-creds", 1)
 
     try:
         session = login(username, password)
     except LoginError as e:
-        print(f"Login error: {e}", file=sys.stderr)
-        sys.exit(2)
+        _die(f"登录失败：{e}", 2)
     except Exception as e:
-        print(f"Network error: {e}", file=sys.stderr)
-        sys.exit(2)
+        _die(f"网络错误：{e}", 2)
 
     if getattr(args, "save_creds", False):
         creds_save(username, password)
@@ -287,43 +349,76 @@ def _get_session(args: argparse.Namespace) -> ArcherySession:
     return session
 
 
-def _get_feishu_client(args: argparse.Namespace) -> FeishuClient:
-    """从参数或保存的配置中构建 FeishuClient。"""
-    app_id     = getattr(args, "feishu_app_id",     None)
-    app_secret = getattr(args, "feishu_app_secret", None)
+def build_stamp() -> str:
+    """
+    这份程序是什么时候构建（开发时是源码最后修改）的。
 
-    if not app_id or not app_secret:
-        if getattr(args, "use_saved_feishu", False):
-            saved = feishu_cfg_load()
-            if not saved.get("app_id") or not saved.get("app_secret"):
-                print(f"Error: no saved Feishu config at {feishu_cfg_path()}", file=sys.stderr)
-                sys.exit(1)
-            app_id     = saved["app_id"]
-            app_secret = saved["app_secret"]
-            print(f"[feishu] using saved config for app_id: {app_id}")
-        else:
-            print("Error: provide --feishu-app-id/--feishu-app-secret or --use-saved-feishu",
-                  file=sys.stderr)
-            sys.exit(1)
+    排查"我跑的到底是不是新包"用——源码改了但 exe 没重打包，是反复踩过的坑；
+    把构建时间写进结果文件和报告，一眼就能对照。
+    """
+    target = sys.executable if getattr(sys, "frozen", False) else __file__
+    try:
+        stamp = datetime.fromtimestamp(os.path.getmtime(target)).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        stamp = "未知"
+    return f"{os.path.basename(target)}（{stamp}）"
 
-    if getattr(args, "save_feishu", False):
-        feishu_cfg_save(
-            app_id,
-            app_secret,
-            folder_token=getattr(args, "folder_token", "") or "",
-        )
-        print(f"[feishu] config saved to {feishu_cfg_path()}")
 
-    use_user_token = getattr(args, "user_token", True)   # 默认用 user token
-    force_reauth   = getattr(args, "reauth", False)
-    # 使用内置凭据（app_id/app_secret 已硬编码在 feishu.py 中）
-    from feishu import FEISHU_APP_ID, FEISHU_APP_SECRET
-    return FeishuClient(
-        app_id=FEISHU_APP_ID,
-        app_secret=FEISHU_APP_SECRET,
-        use_user_token=use_user_token,
-        force_reauth=force_reauth,
-    )
+def _result_path(args: argparse.Namespace, kind: str, default_dir: str | None = None) -> str:
+    """
+    结果文件路径：给了 --output 就用它，否则放在 default_dir（默认当前目录）下的固定名字。
+
+    结果一律写文件，不靠 stdout——见 _write_result 的说明。
+    """
+    output = getattr(args, "output", None)
+    if output:
+        return output
+    base = default_dir or os.getcwd()
+    return os.path.join(base, f"happyhappyhappy-{kind}.json")
+
+
+def _write_result(path: str, payload: dict) -> str:
+    """
+    把结果写成 JSON 文件——新子命令**唯一**的输出通道。
+
+    为什么不打印：打包成 Windows GUI 子系统程序时（`flet pack` 的默认行为，也是给产品双击的那个包），
+    PyInstaller 会把 sys.stdout / sys.stderr 都置成 None，`print()` 遇到 stdout 为 None 会**静默返回**
+    ——命令成功、退出码 0，调用方（尤其是 AI）什么都看不到。老的那些子命令（query / full）真正的产出
+    本来就是文件，所以一直没暴露这个问题；新子命令干脆从设计上就走文件，不再依赖 stdout。
+    成功与失败都写进同一个文件（`ok` 字段区分），这样调用方只要读文件就能判断结果。
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return path
+
+
+def _fail(message: str, result_path: str, exit_code: int = 1, extra: dict | None = None) -> None:
+    """出错：写进结果文件 + 尽力打到 stderr，然后按退出码退出"""
+    payload = {"ok": False, "error": message, "exit_code": exit_code, "result_path": result_path}
+    if extra:
+        payload.update(extra)
+    try:
+        _write_result(result_path, payload)
+    except Exception:
+        pass
+    print(f"Error: {message}", file=sys.stderr)
+    print(f"(结果文件：{result_path})", file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def _load_doc(args: argparse.Namespace, result_path: str):
+    """读文档，出错就把原因（含找过哪些位置）写进结果文件"""
+    explicit = getattr(args, "doc", None)
+    path = explicit or DEFAULT_DOCX
+    try:
+        return load_document(path)
+    except DocxError as e:
+        detail = {"doc_path": path}
+        if not explicit:
+            detail["searched"] = candidate_paths(_DOC_REL)
+        _fail(f"{e}（用 --doc 指定词条表路径）", result_path, 1, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -437,73 +532,196 @@ def cmd_full(args: argparse.Namespace) -> None:
     print(f"Exported {written} rows -> {args.output}")
 
 
-def cmd_upload(args: argparse.Namespace) -> None:
+def cmd_docx_titles(args: argparse.Namespace) -> None:
     """
-    将查询结果 JSON 上传到飞书多维表格，输出在线链接。
+    列出/搜索文档里的小标题，供人工或 AI 选择。
 
-    典型调用（豆包 AI 识图后直接驱动）：
-        happyhappyhappy --cli upload \\
-            --input result.json \\
-            --screenshot ui_screenshot.png \\
-            --use-saved-feishu
+    命中多张表时不做取舍，全部列出——由人确认要哪一张，再传给 shark-export。
+    结果写到 `--output` 指定的文件（默认当前目录的 happyhappyhappy-docx-titles.json）。
     """
-    # 读取查询结果（支持 JSON 和 CSV 两种格式）
-    if args.input.lower().endswith(".csv"):
-        entries = entries_from_csv(args.input)
-    else:
-        with open(args.input, encoding="utf-8") as f:
-            data = json.load(f)
-        entries = entries_from_json(data)
+    result_path = _result_path(args, "docx-titles")
+    doc = _load_doc(args, result_path)
+    keyword = getattr(args, "keyword", "") or ""
+    metas = doc.search(keyword)
 
-    if not entries:
-        print("Error: no entries in input file", file=sys.stderr)
-        sys.exit(1)
+    payload = {
+        "ok": True,
+        "tool": build_stamp(),
+        "keyword": keyword,
+        "count": len(metas),
+        "tables": [
+            {
+                "order": m.order,
+                "period": m.period,
+                "title": m.title,
+                "columns": m.columns,
+                "row_count": m.row_count,
+                "compliant": m.compliant,
+            }
+            for m in metas
+        ],
+        "result_path": result_path,
+    }
+    if not metas:
+        payload["hint"] = "没有匹配的小标题，换个关键词试试"
+    elif any(not m.compliant for m in metas):
+        payload["hint"] = "列不符的表不能导出，需先让文档维护者改成固定六列：" + "、".join(EXPECTED_COLUMNS)
 
-    # 截图路径校验（可选）
-    screenshot_path: str | None = getattr(args, "screenshot", None)
-    if screenshot_path and not os.path.isfile(screenshot_path):
-        print(f"Error: screenshot file not found: {screenshot_path}", file=sys.stderr)
-        sys.exit(1)
+    _write_result(result_path, payload)
+    print(f"Written to {result_path}")
 
-    # 构建飞书客户端
-    client = _get_feishu_client(args)
 
-    # 表格标题
-    title = getattr(args, "title", None) or None  # None 时 feishu.py 自动用时间戳
+def cmd_doc_submit(args: argparse.Namespace) -> None:
+    """
+    把校验结果按固定六列写成一张表，插进**已有飞书文档**的指定标题下面。
 
-    print(f"[feishu] uploading {len(entries)} entries...")
-    if screenshot_path:
-        print(f"[feishu] screenshot: {screenshot_path}")
-
-    # 获取 folder_token（优先命令行参数，其次保存的配置）
-    folder_token = getattr(args, "folder_token", None) or ""
-    if not folder_token and getattr(args, "use_saved_feishu", False):
-        folder_token = feishu_cfg_load().get("folder_token", "")
-    if not folder_token:
-        print("[feishu] WARNING: 未指定 --folder-token，文件将创建在机器人空间，"
-              "你可能没有编辑权限。建议传入 --folder-token 指定你自己的云空间文件夹。",
-              file=sys.stderr)
+    截图走两步：先上传拿 file_token，再让 image 块引用它；每行的截图格都插同一张图。
+    `--probe` 是最小验证模式：只插一个文本块 + 一张 2×2 小表格（带一张图），
+    用来先把块结构在真文档上验一遍。
+    """
+    result_path = _result_path(args, "doc-submit")
 
     try:
-        url = client.create_and_upload(
-            entries,
-            title=title,
-            screenshot_path=screenshot_path,
-            folder_token=folder_token,
-        )
-    except FeishuError as e:
-        print(f"Feishu error: {e}", file=sys.stderr)
-        sys.exit(3)
-    except Exception as e:
-        print(f"Network error: {e}", file=sys.stderr)
-        sys.exit(3)
+        if getattr(args, "probe", False):
+            out = feishu_doc.probe(
+                args.doc_url, args.title, getattr(args, "screenshot", None),
+                force_reauth=getattr(args, "reauth", False),
+            )
+            _write_result(result_path, {"ok": True, "tool": build_stamp(), "probe": True,
+                                        "result_path": result_path, **out})
+            print(f"Written to {result_path}")
+            return
 
-    print(f"[feishu] Done! 在线链接：{url}")
-    # 同时写到 --output 文件（若指定）
-    if getattr(args, "output", None):
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(url + "\n")
-        print(f"[feishu] link saved to {args.output}")
+        if not getattr(args, "input", None):
+            _fail("非探针模式要传 --input（链路 A 的查询结果 JSON）", result_path, 1)
+        with open(args.input, encoding="utf-8") as f:
+            entries = entries_from_json(json.load(f))
+
+        rows = []
+        for i, e in enumerate(entries, start=1):
+            rows.append([
+                str(i),
+                e.key or "",
+                e.zh_cn or "",
+                e.en_us or "",
+                "",                      # en-US by copywriters：链路 A 没有校对值，留空
+                "",                      # 截图列由 build_table 放图片块
+            ])
+
+        client = feishu_doc.FeishuDocClient(force_reauth=getattr(args, "reauth", False))
+        document_id = client.resolve(args.doc_url)     # 支持 /docx/ 和 /wiki/ 两种链接
+
+        image_path = getattr(args, "screenshot", None)
+        image_size_px = feishu_doc.image_size(image_path) if image_path else None
+
+        blocks = client.list_blocks(document_id)
+        parent_id, index = feishu_doc.find_insert_position(blocks, args.title)
+
+        # 行多就拆成多张表：一次请求能带的块数有上限，而且太长的表人也不好读
+        per_table = int(getattr(args, "rows_per_table", None) or 20)
+        chunks = [rows[i:i + per_table] for i in range(0, len(rows), per_table)] or [[]]
+
+        created = 0
+        image_cells = 0
+        for n, chunk in enumerate(chunks, start=1):
+            label = f"{getattr(args, 'label', '') or 'i18n 校验结果'}（{datetime.now():%Y-%m-%d %H:%M}）"
+            if len(chunks) > 1:
+                label += f" 第 {n}/{len(chunks)} 段"
+
+            # ① 建表：截图列先留空（空文本块占位——单元格必须至少有一个子块）
+            nid = feishu_doc._block_id_factory("s")
+            label_id = nid()
+            table = feishu_doc.build_table(header=feishu_doc.TABLE_HEADER, rows=chunk)
+            result = client.create_descendant(
+                document_id, parent_id, index + created,
+                feishu_doc.TablePayload(
+                    children_id=[label_id] + table.children_id,
+                    descendants=[feishu_doc.text_block(label, label_id)] + table.descendants,
+                ),
+            )
+            created += 1 + len(table.children_id)
+
+            # ② 回查拿到表格的真实 block_id（建之前不知道），再逐行把截图放进"截图"列
+            if not image_path:
+                continue
+            created_blocks = result.get("children") or []
+            table_id = next((b.get("block_id") for b in created_blocks
+                             if b.get("block_type") == feishu_doc.BLOCK_TABLE), "")
+            if not table_id:
+                continue
+
+            columns = len(feishu_doc.TABLE_HEADER)
+            cell_ids, _ = feishu_doc.locate_table(client, document_id, table_id)
+            for r in range(1, len(chunk) + 1):          # 0 是表头，跳过
+                cell_index = r * columns + (columns - 1)   # 最后一列 = 截图列
+                if cell_index >= len(cell_ids):
+                    continue
+                image_cell = cell_ids[cell_index]
+                # ③ 单元格里的图片是三步：建空图片块 → 上传素材 → PATCH 换图
+                img_block_id = client.create_image_placeholder(document_id, image_cell, 0)
+                client.put_image_in_block(document_id, image_path, img_block_id)
+                image_cells += 1
+
+        _write_result(result_path, {
+            "ok": True, "tool": build_stamp(), "result_path": result_path,
+            "document_id": document_id,
+            "document_url": f"https://feishu.cn/docx/{document_id}",
+            "title": args.title,
+            "rows": len(rows),
+            "tables": len(chunks),
+            "image_cells": image_cells,
+        })
+        print(f"Written to {result_path}")
+    except Exception as e:                      # 网络/接口错误一律落文件，别只在屏幕上
+        _fail(f"{type(e).__name__}: {e}", result_path, 1)
+
+
+def cmd_shark_export(args: argparse.Namespace) -> None:
+    """
+    从文档里取一张表，按 appId 生成 shark 导入文件。
+
+    产物：`{outdir}/{appid}_{小标题}.xlsx`（每个 appId 一个）+ `{outdir}/report.txt`（人看的）
+    + 结果 JSON（AI 看的，`--output` 指定，默认 {outdir}/happyhappyhappy-shark-export.json）。
+
+    典型调用（AI 驱动）：
+        happyhappyhappy --cli shark-export \\
+            --doc <词条表路径> --title 预订-入住 --use-saved-creds
+    """
+    outdir = getattr(args, "outdir", None) or DEFAULT_OUTDIR
+    result_path = _result_path(args, "shark-export", default_dir=outdir)
+    doc = _load_doc(args, result_path)
+
+    try:
+        content = doc.content(args.title, period=getattr(args, "period", None))
+    except (TableNotFoundError, DocxColumnError) as e:
+        _fail(str(e), result_path, 1)
+
+    session = _get_session(args, result_path)
+    try:
+        appid_by_key = session.query_appid_by_keys([r.key for r in content.rows])
+    except SessionExpiredError as e:
+        _fail(f"Archery session 已过期，请重新登录：{e}", result_path, 2)
+    except ArcheryQueryError as e:
+        _fail(f"查询失败：{e}", result_path, 3)
+
+    # shark 导入模板是常量，已内嵌在程序里，正常不用传；--template 只是调试时的覆盖入口
+    template = getattr(args, "template", None)
+    if template and not os.path.isfile(template):
+        _fail(f"--template 指定的文件不存在：{template}", result_path, 1)
+
+    output = shark.export(content, appid_by_key, outdir=outdir, template=template)
+
+    report_path = os.path.join(outdir, "report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(shark.render_report(output, tool=build_stamp()) + "\n")
+
+    data = {"ok": True, "tool": build_stamp(), **shark.output_to_dict(output),
+            "report_path": report_path, "result_path": result_path}
+    _write_result(result_path, data)
+    print(f"Written to {result_path}")
+
+    if not output.results:
+        sys.exit(4)  # 一行都没导出，调用方需要看出这是失败
 
 
 # ---------------------------------------------------------------------------
@@ -555,35 +773,51 @@ def run_cli(argv=None) -> None:
     p_full.add_argument("--ambiguous", choices=["skip", "all"], default="all")
     _add_auth_args(p_full)
 
-    p_upload = sub.add_parser("upload", help="upload query result JSON to Feishu Bitable")
-    p_upload.add_argument("--input",        required=True,
-                          help="JSON or CSV file from `query` / `full` command")
-    p_upload.add_argument("--screenshot",   default=None,
-                          help="local screenshot image path (optional, shared across all rows)")
-    p_upload.add_argument("--title",        default=None,
-                          help="Bitable title (default: auto-generated with timestamp)")
-    p_upload.add_argument("--folder-token", dest="folder_token", default=None,
-                          help="飞书云空间目标文件夹 token（从文件夹 URL 获取：.../drive/folder/fldcnXXX）"
-                               "。填写后文件创建在你自己的文件夹里，你拥有编辑权限。")
-    p_upload.add_argument("--output",       default=None,
-                          help="write the Feishu URL to this file (optional)")
-    g_feishu = p_upload.add_argument_group("feishu auth (pick one)")
-    g_feishu.add_argument("--feishu-app-id",     dest="feishu_app_id",
-                          help="Feishu app_id")
-    g_feishu.add_argument("--feishu-app-secret", dest="feishu_app_secret",
-                          help="Feishu app_secret")
-    g_feishu.add_argument("--use-saved-feishu",  dest="use_saved_feishu",
-                          action="store_true",
-                          help="use saved config from ~/.happyhappyhappy/feishu.json")
-    g_feishu.add_argument("--save-feishu",       dest="save_feishu",
-                          action="store_true",
-                          help="save app_id/app_secret after successful use")
-    g_feishu.add_argument("--user-token",        dest="user_token",
-                          action="store_true",
-                          help="使用 user_access_token（OAuth 浏览器授权），文件所有者为你本人（推荐）")
-    g_feishu.add_argument("--reauth",            dest="reauth",
-                          action="store_true",
-                          help="强制重新进行 OAuth 授权（清除缓存的 user token）")
+    p_titles = sub.add_parser("docx-titles",
+                              help="list / fuzzy-search section titles in the docx")
+    p_titles.add_argument("--doc", default=None, help=f"docx 路径（默认 {DEFAULT_DOCX}）")
+    p_titles.add_argument("--keyword", default="",
+                          help="小标题关键词；忽略大小写、空格、全半角")
+    p_titles.add_argument("--output", default=None,
+                          help="结果 JSON 写到这个文件（默认：当前目录的 happyhappyhappy-docx-titles.json）")
+    p_titles.add_argument("--json", action="store_true",
+                          help=argparse.SUPPRESS)   # 结果本来就是 JSON，这个参数只为兼容旧调用保留
+
+    p_doc = sub.add_parser("doc-submit",
+                           help="append the check result as a table into an existing Feishu doc")
+    p_doc.add_argument("--doc-url", dest="doc_url", required=True,
+                       help="飞书文档链接（.../docx/xxx）或 document_id")
+    p_doc.add_argument("--title", required=True,
+                       help="插到这个标题下面（文档里标题的完整文字）")
+    p_doc.add_argument("--input", default=None, help="链路 A 的查询结果 JSON（query 的输出）")
+    p_doc.add_argument("--screenshot", default=None, help="界面截图（每行的截图格都插这张）")
+    p_doc.add_argument("--label", default=None, help="批次小标题，默认「i18n 校验结果（时间）」")
+    p_doc.add_argument("--rows-per-table", dest="rows_per_table", type=int, default=20,
+                       help="一张表最多多少行，超了拆成多张（默认 20）")
+    p_doc.add_argument("--probe", action="store_true",
+                       help="最小验证：只插一个文本块 + 一张 2×2 小表格，先把块结构验通")
+    p_doc.add_argument("--reauth", action="store_true",
+                       help="强制重新走一次飞书 OAuth 授权（平时不用加：token 会缓存，"
+                            "access_token 2 小时、refresh_token 30 天，自动刷新）")
+    p_doc.add_argument("--output", default=None, help="结果 JSON 写到这个文件")
+    g_doc = p_doc.add_argument_group("兼容旧调用")
+    g_doc.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    p_shark = sub.add_parser("shark-export",
+                             help="build shark import xlsx files (one per appId) from a docx table")
+    p_shark.add_argument("--doc", default=None, help=f"docx 路径（默认 {DEFAULT_DOCX}）")
+    p_shark.add_argument("--title", required=True,
+                         help="小标题关键词，必须唯一命中；命中多张会报错并列出候选")
+    p_shark.add_argument("--period", default=None, help="小标题重名时用「期」限定")
+    p_shark.add_argument("--template", default=None,
+                         help="可选：用指定文件覆盖内置的 shark 导入模板（调试用，正常不用传）")
+    p_shark.add_argument("--outdir", default=None,
+                         help=f"输出目录（默认 {DEFAULT_OUTDIR}）")
+    p_shark.add_argument("--output", default=None,
+                         help="结果 JSON 写到这个文件（默认：<outdir>/happyhappyhappy-shark-export.json）")
+    p_shark.add_argument("--json", action="store_true",
+                         help=argparse.SUPPRESS)   # 结果本来就是 JSON，这个参数只为兼容旧调用保留
+    _add_auth_args(p_shark)
 
     args = parser.parse_args(argv)
     if args.command == "query":
@@ -594,5 +828,9 @@ def run_cli(argv=None) -> None:
         cmd_import(args)
     elif args.command == "full":
         cmd_full(args)
-    elif args.command == "upload":
-        cmd_upload(args)
+    elif args.command == "docx-titles":
+        cmd_docx_titles(args)
+    elif args.command == "shark-export":
+        cmd_shark_export(args)
+    elif args.command == "doc-submit":
+        cmd_doc_submit(args)

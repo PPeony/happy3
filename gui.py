@@ -1,22 +1,32 @@
 """
 gui.py -- Flet 0.21.2 GUI
 Light theme, high-contrast result list.
+
+两个页签：
+  1. 截图查词条（链路 A）
+  2. 文档 → shark 导入文件（链路 B，人手动兜底路径，主路径是 CLI + skill）
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 
 import flet as ft
 
+import shark
 from archery import ArcheryQueryError, ArcherySession, LoginError, SessionExpiredError, login
-from cli import entries_to_csv, entries_from_csv
+from cli import (
+    DEFAULT_DOCX,
+    DEFAULT_OUTDIR,
+    entries_from_csv,
+    entries_to_csv,
+)
 from credentials import load as creds_load, save as creds_save, cred_path, clear as creds_clear
-from feishu import FeishuClient, FeishuError
-from feishu_config import load as feishu_cfg_load, save as feishu_cfg_save, config_path as feishu_cfg_path
-from models import I18nEntry
+from docx_table import DocxColumnError, DocxError, TableNotFoundError, load_document
+from models import EXPECTED_COLUMNS
 
 COL_ZH    = 160
 COL_APPID = 150
@@ -194,24 +204,39 @@ class MainView(ft.View):
 
         self._file_picker_save = ft.FilePicker(on_result=self._on_save_picked)
         self._file_picker_open = ft.FilePicker(on_result=self._on_import_picked)
-        self._file_picker_screenshot = ft.FilePicker(on_result=self._on_screenshot_picked)
-        self._pending_screenshot_path: str | None = None
 
-        self._feishu_btn = ft.ElevatedButton(
-            "上传飞书", icon=ft.icons.CLOUD_UPLOAD,
-            on_click=self._open_feishu_dialog, disabled=True,
-            style=ft.ButtonStyle(
-                bgcolor={"": "#0052D9", "disabled": "#B0BAC8"},
-                color={"": "#FFFFFF"},
-            ),
+        # ---- 链路 B：文档 → shark 导入文件 ----
+        self._doc = None                     # 解析后的 Document，避免每次搜索都重新解 zip
+        self._doc_picker = ft.FilePicker(on_result=self._on_doc_picked)
+        self._doc_label = ft.Text("未选择词条表文件（也可放在 doc/ 下自动识别）", size=12, color="#888888")
+        self._keyword_field = ft.TextField(
+            label="小标题关键词", hint_text="如：预订-入住（忽略大小写/空格/全半角）",
+            width=320, text_style=ft.TextStyle(color="#1A1A2E"),
+            label_style=ft.TextStyle(color="#555555"),
+            border_color="#B0BAC8", focused_border_color="#1565C0",
         )
+        self._title_group = ft.RadioGroup(content=ft.Column([], spacing=0))
+        self._title_hint = ft.Text("先搜索小标题", size=12, color="#888888")
+        self._outdir_field = ft.TextField(
+            label="输出目录", value=DEFAULT_OUTDIR, width=320,
+            text_style=ft.TextStyle(color="#1A1A2E"),
+            label_style=ft.TextStyle(color="#555555"),
+            border_color="#B0BAC8", focused_border_color="#1565C0",
+        )
+        self._shark_btn = ft.ElevatedButton(
+            "生成 shark 导入文件", icon=ft.icons.TABLE_VIEW,
+            on_click=self._generate_shark, disabled=True,
+            style=ft.ButtonStyle(bgcolor={"": "#2E7D32", "disabled": "#B0BAC8"},
+                                 color={"": "#FFFFFF"}),
+        )
+        self._shark_report = ft.Text("", size=12, color="#1A1A2E", selectable=True)
 
         super().__init__(
             route="/",
             bgcolor="#FFFFFF",
             controls=[
                 ft.AppBar(
-                    title=ft.Text("i18n Key 查询工具", color="#FFFFFF"),
+                    title=ft.Text("i18n 词条工具", color="#FFFFFF"),
                     bgcolor="#1565C0",
                     actions=[
                         ft.Container(
@@ -226,23 +251,79 @@ class MainView(ft.View):
                     ],
                 ),
                 ft.Container(
-                    padding=16, expand=True, bgcolor="#FFFFFF",
-                    content=ft.Column([
-                        ft.Row([self._json_input]),
-                        self._input_error,
-                        ft.Row([self._query_btn, self._query_progress], spacing=12),
-                        ft.Divider(color="#E0E0E0"),
-                        self._result_header,
-                        self._result_list,
-                        ft.Divider(color="#E0E0E0"),
-                        ft.Row(
-                            [self._import_btn, self._export_btn, self._feishu_btn],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        ),
-                    ], expand=True, spacing=8),
+                    expand=True, bgcolor="#FFFFFF",
+                    content=ft.Tabs(
+                        selected_index=0,
+                        tabs=[
+                            ft.Tab(text="截图查词条", content=self._build_query_tab()),
+                            ft.Tab(text="文档 → shark 文件", content=self._build_linkb_tab()),
+                        ],
+                        expand=True,
+                    ),
                 ),
             ],
             padding=0,
+        )
+
+    # --- 页签内容 ---
+
+    def _build_query_tab(self):
+        """链路 A：截图 → 查词条 → CSV"""
+        return ft.Container(
+            padding=16, expand=True,
+            content=ft.Column([
+                ft.Row([self._json_input]),
+                self._input_error,
+                ft.Row([self._query_btn, self._query_progress], spacing=12),
+                ft.Divider(color="#E0E0E0"),
+                self._result_header,
+                self._result_list,
+                ft.Divider(color="#E0E0E0"),
+                ft.Row(
+                    [self._import_btn, self._export_btn],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+            ], expand=True, spacing=8),
+        )
+
+    def _build_linkb_tab(self):
+        """链路 B：文档取表 → 按 appId 生成 shark 导入文件"""
+        return ft.Container(
+            padding=16, expand=True,
+            content=ft.Column([
+                ft.Text("从《RezenOne翻译需求》里取一张表，按 appId 生成 shark 导入文件"
+                        "（生成后人工在 shark 上按项目导入）",
+                        size=13, color="#444444"),
+                ft.Row([
+                    self._doc_label,
+                    ft.OutlinedButton(
+                        "选择文档", icon=ft.icons.FOLDER_OPEN,
+                        on_click=lambda _: self._doc_picker.pick_files(
+                            dialog_title="选择 RezenOne翻译需求.docx",
+                            allowed_extensions=["docx"],
+                            allow_multiple=False,
+                        ),
+                        style=ft.ButtonStyle(side={"": ft.BorderSide(1, "#1565C0")},
+                                             color={"": "#1565C0"}),
+                    ),
+                ], spacing=12),
+                ft.Row([
+                    self._keyword_field,
+                    ft.OutlinedButton(
+                        "搜索小标题", icon=ft.icons.SEARCH, on_click=self._search_titles,
+                        style=ft.ButtonStyle(side={"": ft.BorderSide(1, "#1565C0")},
+                                             color={"": "#1565C0"}),
+                    ),
+                ], spacing=12),
+                self._title_hint,
+                ft.Container(
+                    content=self._title_group, height=200, padding=8,
+                    border=ft.border.all(1, "#E0E0E0"), border_radius=4,
+                ),
+                ft.Row([self._outdir_field, self._shark_btn], spacing=12),
+                ft.Divider(color="#E0E0E0"),
+                self._shark_report,
+            ], expand=True, scroll=ft.ScrollMode.AUTO, spacing=10),
         )
 
     # --- Login ---
@@ -394,7 +475,6 @@ class MainView(ft.View):
         self._result_list.controls = rows
         self._result_header.visible = bool(self._entries)
         self._export_btn.disabled = not bool(self._entries)
-        self._feishu_btn.disabled = not bool(self._entries)
         self._page.update()
 
     # --- Export / Import ---
@@ -444,181 +524,100 @@ class MainView(ft.View):
         except Exception as ex:
             self._snack(f"导入失败：{ex}", error=True)
 
-    # --- Feishu Upload ---
+    # --- 链路 B：文档 → shark 导入文件 ---
 
-    def _open_feishu_dialog(self, _):
-        saved = feishu_cfg_load()
-
-        app_id_field = ft.TextField(
-            label="飞书 App ID",
-            value=saved.get("app_id", ""),
-            autofocus=not bool(saved.get("app_id")),
-            text_style=ft.TextStyle(color="#1A1A2E"),
-        )
-        app_secret_field = ft.TextField(
-            label="飞书 App Secret",
-            password=True, can_reveal_password=True,
-            value=saved.get("app_secret", ""),
-            autofocus=bool(saved.get("app_id")),
-            text_style=ft.TextStyle(color="#1A1A2E"),
-        )
-        folder_token_field = ft.TextField(
-            label="文件夹 Token（强烈建议填写）",
-            value=saved.get("folder_token", ""),
-            hint_text="从文件夹 URL 获取：.../drive/folder/fldcnXXX",
-            helper_text="填写后文件创建在你自己的文件夹里，你拥有编辑权限",
-            helper_style=ft.TextStyle(color="#888888", size=11),
-            text_style=ft.TextStyle(color="#1A1A2E"),
-        )
-        title_field = ft.TextField(
-            label="表格标题（留空自动生成）",
-            hint_text="i18n词条校验_20260731_1430",
-            text_style=ft.TextStyle(color="#1A1A2E"),
-        )
-        remember_cb = ft.Checkbox(
-            label="记住 App ID / App Secret",
-            value=bool(saved),
-            label_style=ft.TextStyle(color="#444444", size=13),
-        )
-        use_user_token_cb = ft.Checkbox(
-            label="用我的飞书账号授权（推荐，文件所有者为你本人）",
-            value=True,
-            label_style=ft.TextStyle(color="#1565C0", size=13),
-        )
-        saved_hint = ft.Text(
-            f"已读取保存的飞书配置（{feishu_cfg_path()}）",
-            size=11, color="#888888", visible=bool(saved),
-        )
-
-        # 截图选择区域
-        self._pending_screenshot_path = None
-        screenshot_label = ft.Text(
-            "未选择截图（可选）", size=12, color="#888888", italic=True,
-        )
-        select_screenshot_btn = ft.OutlinedButton(
-            "选择截图", icon=ft.icons.IMAGE,
-            style=ft.ButtonStyle(
-                side={"": ft.BorderSide(1, "#1565C0")},
-                color={"": "#1565C0"},
-            ),
-        )
-
-        def _pick_screenshot(_):
-            # 先暂存对话框引用，截图选好后继续
-            self._file_picker_screenshot.pick_files(
-                dialog_title="选择界面截图",
-                allowed_extensions=["png", "jpg", "jpeg", "gif", "bmp", "webp"],
-                allow_multiple=False,
-            )
-
-        select_screenshot_btn.on_click = _pick_screenshot
-
-        # 截图回调需要能更新这个 label，存到实例方便 _on_screenshot_picked 访问
-        self._screenshot_label_ref = screenshot_label
-
-        error_text = ft.Text("", color="#C62828", size=12, visible=False)
-        progress   = ft.ProgressRing(visible=False, width=18, height=18)
-        upload_btn = ft.ElevatedButton(
-            "上传",
-            style=ft.ButtonStyle(bgcolor={"": "#0052D9"}, color={"": "#FFFFFF"}),
-        )
-
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("上传到飞书多维表格", color="#1A1A2E"),
-            bgcolor="#FFFFFF",
-            content=ft.Column(
-                [
-                    app_id_field,
-                    app_secret_field,
-                    folder_token_field,
-                    title_field,
-                    ft.Row([select_screenshot_btn, screenshot_label], spacing=12,
-                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    use_user_token_cb,
-                    remember_cb,
-                    saved_hint,
-                    error_text,
-                ],
-                tight=True, spacing=8, width=380,
-            ),
-            actions=[
-                progress,
-                ft.TextButton("取消", on_click=lambda _: self._close_dialog(dlg)),
-                upload_btn,
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-
-        async def do_upload(_):
-            error_text.visible = False
-            upload_btn.disabled = True
-            progress.visible = True
-            self._page.update()
-
-            aid    = (app_id_field.value or "").strip()
-            asec   = (app_secret_field.value or "").strip()
-            ftoken = (folder_token_field.value or "").strip()
-            ttitle = (title_field.value or "").strip() or None
-
-            if not aid or not asec:
-                error_text.value = "请填写 App ID 和 App Secret"
-                error_text.visible = True
-                upload_btn.disabled = False
-                progress.visible = False
-                self._page.update()
-                return
-
-            if remember_cb.value:
-                feishu_cfg_save(aid, asec, folder_token=ftoken)
-
-            screenshot = self._pending_screenshot_path
-
-            try:
-                client = FeishuClient(
-                    app_id=aid,
-                    app_secret=asec,
-                    use_user_token=use_user_token_cb.value,
-                )
-                url = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: client.create_and_upload(
-                        self._entries,
-                        title=ttitle,
-                        screenshot_path=screenshot,
-                        folder_token=ftoken,
-                    )
-                )
-                self._close_dialog(dlg)
-                self._snack(f"上传成功！链接已复制：{url}")
-                self._page.set_clipboard(url)
-            except FeishuError as e:
-                error_text.value = f"飞书错误：{e}"
-                error_text.visible = True
-                upload_btn.disabled = False
-                progress.visible = False
-                self._page.update()
-            except Exception as e:
-                error_text.value = f"网络错误：{e}"
-                error_text.visible = True
-                upload_btn.disabled = False
-                progress.visible = False
-                self._page.update()
-
-        upload_btn.on_click = do_upload
-        self._page.dialog = dlg
-        dlg.open = True
+    def _on_doc_picked(self, e):
+        if not e.files:
+            return
+        path = e.files[0].path
+        try:
+            self._doc = load_document(path)
+        except DocxError as ex:
+            self._doc = None
+            self._snack(f"文档解析失败：{ex}", error=True)
+            return
+        self._doc_label.value = f"{os.path.basename(path)}（{len(self._doc.list())} 张表）"
+        self._doc_label.color = "#2E7D32"
+        self._title_group.content.controls.clear()
+        self._title_hint.value = "文档已加载，搜索小标题"
+        self._shark_btn.disabled = True
         self._page.update()
 
-    def _on_screenshot_picked(self, e):
-        if e.files:
-            self._pending_screenshot_path = e.files[0].path
-            name = e.files[0].name
-            if hasattr(self, "_screenshot_label_ref"):
-                self._screenshot_label_ref.value = f"已选：{name}"
-                self._screenshot_label_ref.color = "#2E7D32"
-                self._screenshot_label_ref.italic = False
-                self._page.update()
+    def _search_titles(self, _):
+        if self._doc is None:
+            try:
+                self._doc = load_document(DEFAULT_DOCX)
+            except DocxError as ex:
+                self._snack(f"文档解析失败：{ex}", error=True)
+                return
+            self._doc_label.value = f"{DEFAULT_DOCX}（{len(self._doc.list())} 张表）"
+            self._doc_label.color = "#2E7D32"
+
+        metas = self._doc.search(self._keyword_field.value or "")
+        controls = self._title_group.content.controls
+        controls.clear()
+        self._shark_btn.disabled = True
+
+        if not metas:
+            self._title_hint.value = "没有匹配的小标题，换个关键词试试"
+        else:
+            for m in metas:
+                label = f"{m.period} {m.title} — {m.row_count} 行"
+                if not m.compliant:
+                    label += "（列不符，不能导出）"
+                controls.append(ft.Radio(
+                    value=f"{m.period}||{m.title}", label=label,
+                    label_style=ft.TextStyle(color="#1A1A2E", size=12),
+                ))
+            hint = f"匹配 {len(metas)} 张表，选中一张再生成"
+            if any(not m.compliant for m in metas):
+                hint += "；列不符的要先让文档维护者改成固定六列：" + "/".join(EXPECTED_COLUMNS)
+            self._title_hint.value = hint
+            self._shark_btn.disabled = False
+        self._page.update()
+
+    def _generate_shark(self, _):
+        if self._doc is None or not self._title_group.value:
+            self._snack("请先搜索并选中一张表", error=True)
+            return
+        if self._session is None:
+            self._snack("请先登录 Archery（需要用 key 反查 appId）", error=True)
+            return
+
+        period, title = self._title_group.value.split("||", 1)
+        try:
+            content = self._doc.content(title, period=period)
+        except (TableNotFoundError, DocxColumnError) as ex:
+            self._snack(f"取表失败：{ex}", error=True)
+            return
+
+        self._shark_report.value = "正在用 key 反查 appId…"
+        self._page.update()
+
+        try:
+            appid_by_key = self._session.query_appid_by_keys([r.key for r in content.rows])
+        except SessionExpiredError:
+            self._snack("Archery session 已过期，请重新登录", error=True)
+            return
+        except Exception as ex:
+            self._snack(f"查询失败：{ex}", error=True)
+            return
+
+        outdir = self._outdir_field.value or DEFAULT_OUTDIR
+        try:
+            output = shark.export(content, appid_by_key, outdir=outdir)
+        except Exception as ex:
+            self._snack(f"生成失败：{ex}", error=True)
+            return
+
+        report = shark.render_report(output)
+        report_path = os.path.join(outdir, "report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report + "\n")
+
+        self._shark_report.value = report
+        self._snack(f"已生成 {len(output.results)} 个文件，报告：{report_path}")
+        self._page.update()
 
     # --- Helpers ---
 
@@ -644,7 +643,7 @@ def run_gui():
         main_view = MainView(page)
         page.overlay.append(main_view._file_picker_save)
         page.overlay.append(main_view._file_picker_open)
-        page.overlay.append(main_view._file_picker_screenshot)
+        page.overlay.append(main_view._doc_picker)
         page.views.clear()
         page.views.append(main_view)
         page.update()

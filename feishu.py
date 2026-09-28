@@ -1,4 +1,13 @@
 """
+DEPRECATED（2026-09-24）：本模块的"上传飞书多维表格"不是需求要的形态，请勿在此基础上加新功能。
+
+需求本体仍然成立——链路 A 的校验结果（key、中文、英文、截图）要提交给飞书 copywriter 系统；
+但要求是写进**对应格式的飞书文档**，而不是多维表格（Bitable）。因此这条 Bitable 链路不再使用，
+CLI 的 `upload` 子命令与 GUI 入口都已移除。详见 doc/spec.md 的"飞书结果提交（挂起）"。
+
+保留原因：需求重启时，凭据加载、OAuth、上传图片拿 file_token 这几部分可以复用。
+下面的内容为历史实现。
+
 feishu.py — 飞书开放平台 API 封装
 
 功能：
@@ -19,11 +28,13 @@ feishu.py — 飞书开放平台 API 封装
   - drive:drive   — 上传图片拿 file_token
 
 user 模式额外要求：
-  - 安全设置 → 重定向 URL 添加：http://localhost
+  - 安全设置 → 重定向 URL 添加：http://localhost:19721/callback（要精确到这个地址，
+    只写 http://localhost 会报 20029）
 """
 from __future__ import annotations
 
 import os
+import warnings
 from datetime import datetime
 from typing import Any
 
@@ -33,37 +44,55 @@ from models import I18nEntry
 
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 
-def _load_app_credentials() -> tuple[str, str]:
+def _load_app_credentials(env=None, home=None) -> tuple[str, str]:
     """
     读取飞书应用凭据，优先级：
     1. 环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET
-    2. ~/.happyhappyhappy/feishu.json
-    打包发布时，由 CI 在构建阶段将凭据写入 feishu.json，不提交到 git。
-    """
-    import json, os
-    from pathlib import Path
+    2. <用户目录>/.happyhappyhappy/feishu.json
 
-    app_id     = os.environ.get("FEISHU_APP_ID", "")
-    app_secret = os.environ.get("FEISHU_APP_SECRET", "")
+    读不出来时把**查过哪里、为什么不行**都列出来——以前一律报"未找到飞书应用凭据"，
+    文件明明存在也看不出原因，白排查（2026-09-28 踩过）。
+    env / home 只是给测试注入用的，正常运行不用传。
+    """
+    import json
+    import os
+    from pathlib import Path as _Path
+
+    env = os.environ if env is None else env
+    home_dir = _Path.home() if home is None else _Path(home)
+
+    app_id = str(env.get("FEISHU_APP_ID", "") or "").strip()
+    app_secret = str(env.get("FEISHU_APP_SECRET", "") or "").strip()
     if app_id and app_secret:
         return app_id, app_secret
 
-    cfg = Path.home() / ".happyhappyhappy" / "feishu.json"
-    if cfg.exists():
+    cfg = home_dir / ".happyhappyhappy" / "feishu.json"
+    tried = [f"环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET：没设置"]
+
+    if not cfg.exists():
+        tried.append(f"配置文件 {cfg}：不存在（用户目录解析为 {home_dir}）")
+    else:
         try:
-            data = json.loads(cfg.read_text(encoding="utf-8"))
-            app_id     = data.get("app_id", "")
-            app_secret = data.get("app_secret", "")
+            # 用 utf-8-sig 读：PowerShell 的 Set-Content -Encoding UTF8 会写 BOM，
+            # 按 utf-8 读再 json.loads 会直接解析失败
+            data = json.loads(cfg.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as e:
+            tried.append(f"配置文件 {cfg}：JSON 解析失败（{e}）—— 检查文件开头有没有 BOM 或多余字符")
+        except Exception as e:
+            tried.append(f"配置文件 {cfg}：读取失败（{type(e).__name__}: {e}）")
+        else:
+            app_id = str(data.get("app_id", "") or "").strip()
+            app_secret = str(data.get("app_secret", "") or "").strip()
             if app_id and app_secret:
                 return app_id, app_secret
-        except Exception:
-            pass
+            tried.append(f"配置文件 {cfg}：内容能解析，但没有 app_id / app_secret"
+                         f"（文件里的字段是 {sorted(data)}）")
 
     raise RuntimeError(
-        "未找到飞书应用凭据。\n"
-        "请设置环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET，\n"
-        "或在 ~/.happyhappyhappy/feishu.json 中写入 app_id 和 app_secret。"
+        "没拿到飞书应用凭据，查过的地方：\n  - " + "\n  - ".join(tried) +
+        "\n修法：把 app_id / app_secret 写进上面那个 feishu.json，或设成环境变量。"
     )
+
 
 FEISHU_APP_ID, FEISHU_APP_SECRET = _load_app_credentials()
 
@@ -101,6 +130,12 @@ class FeishuClient:
         self.use_user_token = use_user_token
         self.force_reauth = force_reauth
         self._token: str | None = None
+        warnings.warn(
+            "feishu.py 已废弃：上传多维表格不是需求要的形态（要写进指定格式的飞书文档），"
+            "见 doc/spec.md「飞书结果提交（挂起）」",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     # ------------------------------------------------------------------
     # Step 0: token
@@ -400,6 +435,11 @@ def upload_to_feishu(
     无需外部传凭据，打包后直接调用。
     返回飞书多维表格在线链接。
     """
+    warnings.warn(
+        "upload_to_feishu 已废弃：上传多维表格不是需求要的形态，见 doc/spec.md",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     client = FeishuClient(
         app_id=FEISHU_APP_ID,
         app_secret=FEISHU_APP_SECRET,

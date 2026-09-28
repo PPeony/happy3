@@ -1,6 +1,9 @@
 """
 feishu_auth.py — 飞书 OAuth2 user_access_token 获取
 
+多维表格那条链路（feishu.py）已废弃，但**这里的 OAuth 被新链路复用**：
+写飞书文档（feishu_doc.py）同样要用 user_access_token，所以本模块是活的，不是历史包袱。
+
 流程：
   1. 本地起临时 HTTP server 监听 localhost:19721
   2. 打开浏览器，跳转飞书授权页
@@ -114,10 +117,19 @@ def get_user_access_token(
     """
     if not app_id or not app_secret:
         app_id, app_secret = _get_app_creds()
+
+    if force_reauth:
+        # 说一句，免得以为是"授权没生效"——其实是这个参数要求每次重新授权
+        print("[feishu] 你指定了 --reauth：强制重新走一次浏览器授权"
+              "（去掉这个参数就会复用缓存的 token，不用再弹浏览器）")
+
     if not force_reauth:
         cached = _load_token()
         if cached:
-            if cached.get("access_token_expire", 0) - time.time() > 300:
+            left = cached.get("access_token_expire", 0) - time.time()
+            if left > 300:
+                print(f"[feishu] 用缓存的 token（还剩约 {int(left // 60)} 分钟；"
+                      f"想强制重新授权加 --reauth）")
                 return cached["access_token"]
             if cached.get("refresh_token_expire", 0) - time.time() > 300:
                 try:
@@ -150,7 +162,9 @@ def _oauth_flow(app_id: str, app_secret: str) -> str:
             "app_id":        app_id,
             "redirect_uri":  _REDIRECT_URI,
             "response_type": "code",
-            "scope":         "bitable:app drive:drive",
+            # docx:document 写文档要；wiki:node:read 用于把知识库(wiki)链接换成文档 token
+            # （文档挂在知识库里时，链接上那个是节点 token，不是 document_id，必须查一次）
+            "scope":         "bitable:app drive:drive docx:document wiki:node:read",
         })
     )
 
@@ -191,6 +205,12 @@ def _oauth_flow(app_id: str, app_secret: str) -> str:
     t.start()
 
     print(f"\n[feishu] 正在打开浏览器进行飞书授权...")
+    print(f"[feishu] 应用 app_id：{app_id}")
+    print(f"[feishu] 回调地址（必须**原样**登记在该应用的"
+          f"「安全设置 → 重定向 URL」里，飞书要求精确匹配）：")
+    print(f"         {_REDIRECT_URI}")
+    print(f"[feishu] 浏览器若报 20029「重定向 URL 有误」，就是这个地址没登记或写法不一致"
+          f"（常见错法：只写 http://localhost、少了端口或 /callback）。")
     print(f"[feishu] 如果浏览器未自动打开，请手动访问：\n  {auth_url}\n")
     webbrowser.open(auth_url)
 
