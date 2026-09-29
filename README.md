@@ -17,10 +17,12 @@
 **命令行**（AI 助手用得多，人也可以自己跑）：
 
 ```bash
-happyhappyhappy --cli docx-titles   --doc <词条表> --keyword 入住
-happyhappyhappy --cli shark-export  --doc <词条表> --title 预订-入住 --use-saved-creds
+happyhappyhappy --cli docx-titles   --feishu-doc <飞书文档链接> --keyword 入住
+happyhappyhappy --cli shark-export  --feishu-doc <飞书文档链接> --title 预订-入住 --use-saved-creds
 happyhappyhappy --cli doc-submit    --doc-url <飞书文档链接> --title <标题> --input <结果JSON> --screenshot <截图>
 ```
+
+前两条也可以读本地导出的 docx（把 `--feishu-doc <链接>` 换成 `--doc <路径>`），离线时用。三条命令第一次跑都会弹浏览器让飞书授权，之后 token 缓存 30 天。
 
 ⚠️ **命令的产出都是文件**（结果 JSON、CSV、xlsx、report.txt），**屏幕上看不到输出是正常的**——
 直接打开生成的文件看就行。在 cmd 里跑建议加 `start /wait`，否则提示符会先回来（程序还在后台跑）。
@@ -54,7 +56,7 @@ flet pack main.py --name "happyhappyhappy" --icon "img/app.ico"   # 打包成 di
 
 ```bash
 pytest tests/test_cli.py tests/test_docx_table.py tests/test_shark.py \
-       tests/test_archery_lookup.py tests/test_feishu_doc.py -v
+       tests/test_archery_lookup.py tests/test_feishu_doc.py tests/test_feishu_table.py -v
 ```
 
 ## skill 的落点（改 skill 时看这里）

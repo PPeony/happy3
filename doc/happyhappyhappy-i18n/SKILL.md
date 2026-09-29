@@ -27,11 +27,12 @@ description: Use when a user sends a UI screenshot to extract i18n keys, wants s
    `sys.stdout` / `stderr` 都是 `None`）——读结果文件即可，见下面 B1。
    另外这个 exe 是 **GUI 子系统**程序，**cmd.exe 不等它跑完就返回提示符**（看着像异步，其实还在后台跑）——
    在 cmd 里要用 `start /wait happyhappyhappy.exe ...`；不加的话别急着读结果文件，等十几秒再看。
-3. **词条表**（B 流程用）：**由使用方提供路径**，用 `--doc <路径>` 传给工具——绝对路径、相对路径都行，
-   文件名随意，不需要放进任何特定目录。开发时如果它就放在 `doc/` 下（工具目录、其上一级或当前目录），
-   不传 `--doc` 也能找到，但这只是便利，别依赖。
+3. **词条表**（B 流程用）——**两个数据源二选一**：
+   - `--feishu-doc <链接>`：直接读飞书**活文档**（`/docx/` 或 `/wiki/` 链接都行）。**优先用这个**：
+     不用先导出 docx，读的是当下这一份，不会因为"文档更新了、没人重新导出"而拿到旧数据；
+   - `--doc <路径>`：读本地导出的 docx，离线可用；绝对/相对路径都行、文件名随意。
+   用户给了链接就用前者、给了文件路径就用后者；两个都没给就直接问他要，别自己去找一份来用。
    shark 导入模板是常量、已经内嵌在程序里，**不需要传 `--template`**（那是调试用的覆盖入口）。
-   用户没给路径时就直接问他要，别自己去找一份来用。
 
 ---
 
@@ -54,7 +55,8 @@ description: Use when a user sends a UI screenshot to extract i18n keys, wants s
 ### Step B1 — 搜索小标题
 
 ```bash
-happyhappyhappy --cli docx-titles --doc <词条表路径> --keyword 入住
+happyhappyhappy --cli docx-titles --feishu-doc <飞书文档链接> --keyword 入住
+# 或读本地导出的 docx：happyhappyhappy --cli docx-titles --doc <词条表路径> --keyword 入住
 ```
 
 **结果一律写文件，读文件，别指望屏幕输出。** 打包产物是没有控制台的 GUI 程序（`console=False`），
@@ -66,18 +68,23 @@ happyhappyhappy --cli docx-titles --doc <词条表路径> --keyword 入住
 - 关键词忽略大小写、空格、全半角，也可以是"第二期 预订-入住"这种组合。
 - 什么都不传则列出全部表，返回里带 `period` / `title` / `row_count` / `compliant`。
 - **命中多条 → 把候选列给用户，让用户选。命中 0 条 → 把相近候选给用户。都不要自己决定。**
-- `compliant: false` 的表不能导出，先告诉用户需要改文档。
+- `compliant: false` 的表不能导出，先告诉用户需要改文档。**不加关键词跑一遍，就是"哪些表还要改"的清单**——
+  用户问"还有哪些表没改好"时，直接跑这个给他。
+- 读飞书文档时结果里还带 `warnings`（读的是活文档，能顺手自检）：单元格数对不上"行×列"（多半有合并
+  单元格，列位置会错位）、表格块没带行列数、整篇没读到表格。**有 warnings 就原样告诉用户**，
+  这几种情况下解析出来的内容不可信。
 
 ### Step B2 — 生成 shark 导入文件
 
 ```bash
 happyhappyhappy --cli shark-export \
-  --doc <词条表路径> \
+  --feishu-doc <飞书文档链接> \
   --title 预订-入住 \
   --outdir shark_import \
   --use-saved-creds
 ```
 
+- 命令里的 `--feishu-doc <链接>` 也可以换成 `--doc <本地 docx 路径>`（离线时用），其余参数一样；
 - `--title` 是 B1 里用户选中的小标题关键词，必须唯一命中，否则报错并列出候选。
 - 工具用 key 反查 appId（key 已知，不做模糊匹配）。
 - **key 会被校正成库里的写法**，结果 JSON 的 `expanded_keys` 里是 `文档里的写法 → 库里真正的写法`，
@@ -219,8 +226,8 @@ happyhappyhappy --cli doc-submit \
 | `query` | texts.json + 凭据 | JSON |
 | `export` | `query` 的 JSON | CSV |
 | `import` | 研发改过的 CSV | 干净的 CSV |
-| `docx-titles` | docx + 关键词 | 小标题列表 → 结果 JSON |
-| `shark-export` | docx + 小标题 + 凭据 | `{appid}_{小标题}.xlsx` + report.txt + 结果 JSON |
+| `docx-titles` | 飞书链接 或 docx + 关键词 | 小标题列表 → 结果 JSON |
+| `shark-export` | 飞书链接 或 docx + 小标题 + 凭据 | `{appid}_{小标题}.xlsx` + report.txt + 结果 JSON |
 | `doc-submit` | 飞书文档链接 + 标题 + 结果 JSON | 往文档里写六列表格（结果 JSON 带 `ok`） |
 
 认证参数（`query` / `full` / `shark-export` 通用，选一个）：

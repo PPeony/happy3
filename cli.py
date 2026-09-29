@@ -28,7 +28,9 @@ import shark
 from archery import ArcheryQueryError, ArcherySession, LoginError, SessionExpiredError, login
 from credentials import load as creds_load, save as creds_save, cred_path
 import feishu_doc
+import feishu_table
 from docx_table import DocxColumnError, DocxError, TableNotFoundError, load_document
+from table_doc import TableDocError
 from models import EXPECTED_COLUMNS, Candidate, I18nEntry
 
 def _tool_dir() -> str:
@@ -408,8 +410,23 @@ def _fail(message: str, result_path: str, exit_code: int = 1, extra: dict | None
     sys.exit(exit_code)
 
 
-def _load_doc(args: argparse.Namespace, result_path: str):
-    """读文档，出错就把原因（含找过哪些位置）写进结果文件"""
+def _load_source(args: argparse.Namespace, result_path: str):
+    """
+    读词条表，两个数据源选一个：
+
+    - `--feishu-doc <链接>`：直接读飞书**活文档**（不用先导出 docx，也不会读到旧快照）；
+    - `--doc <路径>`（或默认位置）：读本地导出的 docx，离线也能用。
+    """
+    link = getattr(args, "feishu_doc", None)
+    if link:
+        try:
+            document = feishu_table.load_document(link)
+        except TableDocError as e:
+            _fail(f"{e}", result_path, 1, {"feishu_doc": link})
+        for warning in document.warnings:
+            print(f"[warn] {warning}", file=sys.stderr)
+        return document
+
     explicit = getattr(args, "doc", None)
     path = explicit or DEFAULT_DOCX
     try:
@@ -418,7 +435,7 @@ def _load_doc(args: argparse.Namespace, result_path: str):
         detail = {"doc_path": path}
         if not explicit:
             detail["searched"] = candidate_paths(_DOC_REL)
-        _fail(f"{e}（用 --doc 指定词条表路径）", result_path, 1, detail)
+        _fail(f"{e}（用 --doc 指定词条表路径，或用 --feishu-doc 直接读飞书文档）", result_path, 1, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -540,13 +557,15 @@ def cmd_docx_titles(args: argparse.Namespace) -> None:
     结果写到 `--output` 指定的文件（默认当前目录的 happyhappyhappy-docx-titles.json）。
     """
     result_path = _result_path(args, "docx-titles")
-    doc = _load_doc(args, result_path)
+    doc = _load_source(args, result_path)
     keyword = getattr(args, "keyword", "") or ""
     metas = doc.search(keyword)
 
     payload = {
         "ok": True,
         "tool": build_stamp(),
+        "source": doc.source,
+        "warnings": list(getattr(doc, "warnings", [])),
         "keyword": keyword,
         "count": len(metas),
         "tables": [
@@ -689,7 +708,7 @@ def cmd_shark_export(args: argparse.Namespace) -> None:
     """
     outdir = getattr(args, "outdir", None) or DEFAULT_OUTDIR
     result_path = _result_path(args, "shark-export", default_dir=outdir)
-    doc = _load_doc(args, result_path)
+    doc = _load_source(args, result_path)
 
     try:
         content = doc.content(args.title, period=getattr(args, "period", None))
@@ -776,6 +795,8 @@ def run_cli(argv=None) -> None:
     p_titles = sub.add_parser("docx-titles",
                               help="list / fuzzy-search section titles in the docx")
     p_titles.add_argument("--doc", default=None, help=f"docx 路径（默认 {DEFAULT_DOCX}）")
+    p_titles.add_argument("--feishu-doc", dest="feishu_doc", default=None,
+                          help="改读飞书活文档：给 /docx/ 或 /wiki/ 链接（与 --doc 二选一）")
     p_titles.add_argument("--keyword", default="",
                           help="小标题关键词；忽略大小写、空格、全半角")
     p_titles.add_argument("--output", default=None,
@@ -806,6 +827,8 @@ def run_cli(argv=None) -> None:
     p_shark = sub.add_parser("shark-export",
                              help="build shark import xlsx files (one per appId) from a docx table")
     p_shark.add_argument("--doc", default=None, help=f"docx 路径（默认 {DEFAULT_DOCX}）")
+    p_shark.add_argument("--feishu-doc", dest="feishu_doc", default=None,
+                         help="改读飞书活文档：给 /docx/ 或 /wiki/ 链接（与 --doc 二选一）")
     p_shark.add_argument("--title", required=True,
                          help="小标题关键词，必须唯一命中；命中多张会报错并列出候选")
     p_shark.add_argument("--period", default=None, help="小标题重名时用「期」限定")
